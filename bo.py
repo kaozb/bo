@@ -473,31 +473,119 @@ def execute_tool(name, args, opts):
 # LLM 调用
 # ---------------------------------------------------------------------------
 
-def call_llm(messages, opts):
+def _merge_tool_call_delta(acc, delta):
+    """把流式返回的一块 tool_calls 分片合并进累积结果。
+
+    分片可能只带 index/id/function.name/function.arguments 的一部分，需按 index 归并。
+    """
+    for piece in delta or []:
+        idx = piece.get("index")
+        if idx is None:
+            idx = len(acc)
+        while len(acc) <= idx:
+            acc.append({"id": None, "type": "function",
+                        "function": {"name": "", "arguments": ""}})
+        slot = acc[idx]
+        if piece.get("id"):
+            slot["id"] = piece["id"]
+        if piece.get("type"):
+            slot["type"] = piece["type"]
+        fn = piece.get("function") or {}
+        if fn.get("name"):
+            slot["function"]["name"] = fn["name"]
+        if fn.get("arguments"):
+            slot["function"]["arguments"] += fn["arguments"]
+
+
+def call_llm(messages, opts, on_delta=None):
+    """流式请求 /chat/completions，返回聚合后的 message 字典。
+
+    on_delta(kind, text)：kind 为 "content" 或 "reasoning"，text 为本次新增文本。
+    若服务端不支持流式（未返回 data: 行），自动回退到一次性 JSON 解析。
+    """
     payload = {"model": opts["model"], "messages": messages,
-               "tools": TOOLS, "tool_choice": "auto"}
+               "tools": TOOLS, "tool_choice": "auto", "stream": True}
     url = opts["base_url"].rstrip("/") + "/chat/completions"
     req = urllib.request.Request(
         url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), method="POST")
     req.add_header("Content-Type", "application/json")
+    req.add_header("Accept", "text/event-stream")
     if opts["api_key"]:
         req.add_header("Authorization", "Bearer " + opts["api_key"])
 
+    content_parts, reasoning_parts, tool_calls = [], [], []
+    raw_lines, total = [], 0
+    saw_sse = False
+
     try:
         resp = urllib.request.urlopen(req, timeout=opts["http_timeout"])
-        try:
-            body = resp.read(MAX_RESPONSE_BYTES + 1)
-        finally:
-            resp.close()
     except urllib.error.HTTPError as e:
         raise RuntimeError("HTTP %s 错误: %s" % (e.code, _truncate(_decode(e.read()), 2000)))
     except urllib.error.URLError as e:
         raise RuntimeError("网络错误: %s" % e.reason)
 
-    if len(body) > MAX_RESPONSE_BYTES:
-        raise RuntimeError("响应过大（> %d MB），已拒绝" % (MAX_RESPONSE_BYTES // 1048576))
     try:
-        obj = json.loads(_decode(body))
+        for raw in resp:
+            total += len(raw)
+            if total > MAX_RESPONSE_BYTES:
+                raise RuntimeError("响应过大（> %d MB），已拒绝" % (MAX_RESPONSE_BYTES // 1048576))
+            line = _decode(raw).strip()
+            if not line:
+                continue
+            if not line.startswith("data:"):
+                if not saw_sse:
+                    raw_lines.append(_decode(raw))
+                continue
+            saw_sse = True
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data)
+            except ValueError:
+                continue
+            if isinstance(chunk, dict) and chunk.get("error"):
+                raise RuntimeError("接口返回错误: %s" % chunk["error"])
+            try:
+                delta = chunk["choices"][0].get("delta") or {}
+            except (KeyError, IndexError, TypeError):
+                continue
+            reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
+            if reasoning:
+                reasoning_parts.append(reasoning)
+                if on_delta:
+                    on_delta("reasoning", reasoning)
+            text = delta.get("content") or ""
+            if text:
+                content_parts.append(text)
+                if on_delta:
+                    on_delta("content", text)
+            if delta.get("tool_calls"):
+                _merge_tool_call_delta(tool_calls, delta["tool_calls"])
+    except RuntimeError:
+        raise
+    except Exception as e:
+        raise RuntimeError("读取流式响应失败: %s" % e)
+    finally:
+        resp.close()
+
+    if not saw_sse:
+        # 服务端未按 SSE 返回（有的兼容实现忽略 stream=true），回退为整体解析
+        return _parse_full_response("".join(raw_lines))
+
+    msg = {"role": "assistant", "content": "".join(content_parts)}
+    reasoning = "".join(reasoning_parts)
+    if reasoning:
+        msg["reasoning_content"] = reasoning
+    if tool_calls:
+        msg["tool_calls"] = tool_calls
+    return msg
+
+
+def _parse_full_response(text):
+    """非流式回退：解析完整 JSON 响应，取出 message。"""
+    try:
+        obj = json.loads(text)
     except Exception as e:
         raise RuntimeError("响应不是合法 JSON: %s" % e)
     if isinstance(obj, dict) and obj.get("error"):
@@ -542,6 +630,7 @@ class Output(object):
     def __init__(self, level, color, log_path):
         self.level, self.color, self.log_path = level, color, log_path
         self._log = None
+        self._stream_open = None
         self.session_id = 0
         if log_path:
             self.session_id = _count_sessions(log_path)
@@ -579,6 +668,38 @@ class Output(object):
     def assistant(self, text, is_final):
         if text and (self.level > LEVEL_QUIET or is_final):
             self._w("\n" + text + "\n")
+
+    # --- 流式增量输出 ---
+    def stream_begin(self, kind):
+        """一段流式内容开始前调用，负责换行与着色前缀。"""
+        if kind == "reasoning":
+            if self.level >= LEVEL_VERBOSE:
+                self._stream_open = self.DIM
+            else:
+                self._stream_open = None
+        else:
+            # 正文：quiet 级别下不实时打印，留给最终答复统一显示
+            self._stream_open = None if self.level == LEVEL_QUIET else ""
+        if self._stream_open is not None:
+            sys.stdout.write("\n")
+            if self._stream_open:
+                sys.stdout.write(self._stream_open)
+            sys.stdout.flush()
+
+    def stream_delta(self, text):
+        if self._stream_open is None:
+            return
+        sys.stdout.write(text)
+        sys.stdout.flush()
+
+    def stream_end(self):
+        if self._stream_open is None:
+            return
+        if self._stream_open:
+            sys.stdout.write(self.RESET)
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+        self._stream_open = None
 
     def reasoning(self, text):
         if text and self.level >= LEVEL_VERBOSE:
@@ -634,17 +755,43 @@ def run_turn(user_text, messages, opts, out):
     messages.append({"role": "user", "content": user_text})
 
     for _ in range(opts["max_steps"]):
-        msg = call_llm(messages, opts)
+        # 流式回调：边收边打印；正文始终实时显示，思考仅在 verbose 级别显示
+        stream_gap = {"content": False}
+        cur_kind = {"v": None}
+
+        def on_delta(kind, text):
+            if kind == "reasoning" and out.level < LEVEL_VERBOSE:
+                return
+            if kind == "content" and stream_gap["content"] and cur_kind["v"] == "reasoning":
+                out.stream_end()  # 正文在思考之后出现时另起一行
+                cur_kind["v"] = None
+            if cur_kind["v"] != kind:
+                if cur_kind["v"] is not None:
+                    out.stream_end()
+                out.stream_begin(kind)
+                cur_kind["v"] = kind
+            out.stream_delta(text)
+            if kind == "content":
+                stream_gap["content"] = True
+
+        try:
+            msg = call_llm(messages, opts, on_delta)
+        finally:
+            if cur_kind["v"] is not None:
+                out.stream_end()
+
         content = msg.get("content") or ""
         reasoning = msg.get("reasoning_content") or msg.get("reasoning") or ""
         tool_calls = msg.get("tool_calls") or []
 
+        # 内容已在流式阶段实时打印，这里只补写日志（quiet 级别下思考被跳过，正文最终答复见下）
         if reasoning:
             out.log("THINKING", reasoning.strip())
-            out.reasoning(reasoning.strip())
         if content:
             out.log("ASSISTANT", content)
-            out.assistant(content, not tool_calls)
+        # content 为空但 quiet 级别下未打印过任何正文时，兜底显示
+        if content and out.level == LEVEL_QUIET and not tool_calls:
+            out.assistant(content, True)
 
         assistant_msg = {"role": "assistant", "content": msg.get("content")}
         if tool_calls:

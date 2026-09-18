@@ -475,31 +475,122 @@ def execute_tool(name, args, opts):
 # LLM calls
 # ---------------------------------------------------------------------------
 
-def call_llm(messages, opts):
+def _merge_tool_call_delta(acc, delta):
+    """Merge one streamed tool_calls fragment into the accumulated list.
+
+    A fragment may carry only part of index/id/function.name/function.arguments,
+    so pieces are merged by their index.
+    """
+    for piece in delta or []:
+        idx = piece.get("index")
+        if idx is None:
+            idx = len(acc)
+        while len(acc) <= idx:
+            acc.append({"id": None, "type": "function",
+                        "function": {"name": "", "arguments": ""}})
+        slot = acc[idx]
+        if piece.get("id"):
+            slot["id"] = piece["id"]
+        if piece.get("type"):
+            slot["type"] = piece["type"]
+        fn = piece.get("function") or {}
+        if fn.get("name"):
+            slot["function"]["name"] = fn["name"]
+        if fn.get("arguments"):
+            slot["function"]["arguments"] += fn["arguments"]
+
+
+def call_llm(messages, opts, on_delta=None):
+    """Stream /chat/completions and return the aggregated message dict.
+
+    on_delta(kind, text): kind is "content" or "reasoning", text is the new piece.
+    If the server ignores stream=true (no data: lines), falls back to parsing
+    the full JSON response at once.
+    """
     payload = {"model": opts["model"], "messages": messages,
-               "tools": TOOLS, "tool_choice": "auto"}
+               "tools": TOOLS, "tool_choice": "auto", "stream": True}
     url = opts["base_url"].rstrip("/") + "/chat/completions"
     req = urllib.request.Request(
         url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), method="POST")
     req.add_header("Content-Type", "application/json")
+    req.add_header("Accept", "text/event-stream")
     if opts["api_key"]:
         req.add_header("Authorization", "Bearer " + opts["api_key"])
 
+    content_parts, reasoning_parts, tool_calls = [], [], []
+    raw_lines, total = [], 0
+    saw_sse = False
+
     try:
         resp = urllib.request.urlopen(req, timeout=opts["http_timeout"])
-        try:
-            body = resp.read(MAX_RESPONSE_BYTES + 1)
-        finally:
-            resp.close()
     except urllib.error.HTTPError as e:
         raise RuntimeError("HTTP %s error: %s" % (e.code, _truncate(_decode(e.read()), 2000)))
     except urllib.error.URLError as e:
         raise RuntimeError("Network error: %s" % e.reason)
 
-    if len(body) > MAX_RESPONSE_BYTES:
-        raise RuntimeError("Response too large (> %d MB), rejected" % (MAX_RESPONSE_BYTES // 1048576))
     try:
-        obj = json.loads(_decode(body))
+        for raw in resp:
+            total += len(raw)
+            if total > MAX_RESPONSE_BYTES:
+                raise RuntimeError("Response too large (> %d MB), rejected" % (MAX_RESPONSE_BYTES // 1048576))
+            line = _decode(raw).strip()
+            if not line:
+                continue
+            if not line.startswith("data:"):
+                if not saw_sse:
+                    raw_lines.append(_decode(raw))
+                continue
+            saw_sse = True
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data)
+            except ValueError:
+                continue
+            if isinstance(chunk, dict) and chunk.get("error"):
+                raise RuntimeError("API returned an error: %s" % chunk["error"])
+            try:
+                delta = chunk["choices"][0].get("delta") or {}
+            except (KeyError, IndexError, TypeError):
+                continue
+            reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
+            if reasoning:
+                reasoning_parts.append(reasoning)
+                if on_delta:
+                    on_delta("reasoning", reasoning)
+            text = delta.get("content") or ""
+            if text:
+                content_parts.append(text)
+                if on_delta:
+                    on_delta("content", text)
+            if delta.get("tool_calls"):
+                _merge_tool_call_delta(tool_calls, delta["tool_calls"])
+    except RuntimeError:
+        raise
+    except Exception as e:
+        raise RuntimeError("Failed to read streaming response: %s" % e)
+    finally:
+        resp.close()
+
+    if not saw_sse:
+        # Server did not return SSE (some compatible backends ignore stream=true),
+        # fall back to parsing the whole body as JSON.
+        return _parse_full_response("".join(raw_lines))
+
+    msg = {"role": "assistant", "content": "".join(content_parts)}
+    reasoning = "".join(reasoning_parts)
+    if reasoning:
+        msg["reasoning_content"] = reasoning
+    if tool_calls:
+        msg["tool_calls"] = tool_calls
+    return msg
+
+
+def _parse_full_response(text):
+    """Non-streaming fallback: parse a complete JSON response and return message."""
+    try:
+        obj = json.loads(text)
     except Exception as e:
         raise RuntimeError("Response is not valid JSON: %s" % e)
     if isinstance(obj, dict) and obj.get("error"):
@@ -544,6 +635,7 @@ class Output(object):
     def __init__(self, level, color, log_path):
         self.level, self.color, self.log_path = level, color, log_path
         self._log = None
+        self._stream_open = None
         self.session_id = 0
         if log_path:
             self.session_id = _count_sessions(log_path)
@@ -582,6 +674,38 @@ class Output(object):
     def assistant(self, text, is_final):
         if text and (self.level > LEVEL_QUIET or is_final):
             self._w("\n" + text + "\n")
+
+    # --- streaming incremental output ---
+    def stream_begin(self, kind):
+        """Called before a streamed segment starts; handles the newline and color prefix."""
+        if kind == "reasoning":
+            if self.level >= LEVEL_VERBOSE:
+                self._stream_open = self.DIM
+            else:
+                self._stream_open = None
+        else:
+            # content: at quiet level do not print live, leave it to the final answer
+            self._stream_open = None if self.level == LEVEL_QUIET else ""
+        if self._stream_open is not None:
+            sys.stdout.write("\n")
+            if self._stream_open:
+                sys.stdout.write(self._stream_open)
+            sys.stdout.flush()
+
+    def stream_delta(self, text):
+        if self._stream_open is None:
+            return
+        sys.stdout.write(text)
+        sys.stdout.flush()
+
+    def stream_end(self):
+        if self._stream_open is None:
+            return
+        if self._stream_open:
+            sys.stdout.write(self.RESET)
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+        self._stream_open = None
 
     def reasoning(self, text):
         if text and self.level >= LEVEL_VERBOSE:
@@ -639,17 +763,43 @@ def run_turn(user_text, messages, opts, out):
     messages.append({"role": "user", "content": user_text})
 
     for _ in range(opts["max_steps"]):
-        msg = call_llm(messages, opts)
+        # streaming callback: print as pieces arrive; content always live, reasoning only at verbose
+        stream_gap = {"content": False}
+        cur_kind = {"v": None}
+
+        def on_delta(kind, text):
+            if kind == "reasoning" and out.level < LEVEL_VERBOSE:
+                return
+            if kind == "content" and stream_gap["content"] and cur_kind["v"] == "reasoning":
+                out.stream_end()  # content after reasoning starts on its own line
+                cur_kind["v"] = None
+            if cur_kind["v"] != kind:
+                if cur_kind["v"] is not None:
+                    out.stream_end()
+                out.stream_begin(kind)
+                cur_kind["v"] = kind
+            out.stream_delta(text)
+            if kind == "content":
+                stream_gap["content"] = True
+
+        try:
+            msg = call_llm(messages, opts, on_delta)
+        finally:
+            if cur_kind["v"] is not None:
+                out.stream_end()
+
         content = msg.get("content") or ""
         reasoning = msg.get("reasoning_content") or msg.get("reasoning") or ""
         tool_calls = msg.get("tool_calls") or []
 
+        # content was already printed live; here only record the log
         if reasoning:
             out.log("THINKING", reasoning.strip())
-            out.reasoning(reasoning.strip())
         if content:
             out.log("ASSISTANT", content)
-            out.assistant(content, not tool_calls)
+        # fallback for quiet level, where live content was suppressed: show the final answer
+        if content and out.level == LEVEL_QUIET and not tool_calls:
+            out.assistant(content, True)
 
         assistant_msg = {"role": "assistant", "content": msg.get("content")}
         if tool_calls:
