@@ -28,6 +28,8 @@ BO.log
 .env
 .env.*
 *.local
+.bo
+.bo-*.tmp
 
 # Editors / OS
 .idea/

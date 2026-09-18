@@ -13,7 +13,7 @@
     python BO.py
 
 参数:
-    --model / --base-url / --api-key   覆盖对应环境变量
+    -m, --model / --base-url / --api-key   覆盖对应环境变量
     --yes               命令执行前逐条人工确认（不加则默认直接放行）
     --root DIR          限制 read_file/edit_file 只能访问 DIR 之内（默认不限制）
     --max-steps N       单轮最多工具调用轮数（默认 50）
@@ -22,11 +22,20 @@
     -v / -vv            显示工具结果与思考 / 完整明细
     --no-color          关闭彩色输出
     -l, --log [FILE]    完整交互写入日志（默认 BO.log），屏幕上不显示明细
+    --no-log            撤销已记录的 -l/--log，停止写日志
+
+参数记忆: 显式传入的连接类参数（-m / --base-url / --api-key / --root / --max-steps /
+          --http-timeout / -l）会加密记录到当前目录的 .bo，之后不传参或只传部分参数时自动复用；
+          --yes / -q / -v / --no-color 等交互与显示开关仅本次生效，不写入该文件。
+          优先级: 命令行 > 环境变量 > .bo > 内置默认；删除 .bo 即恢复默认。
 
 交互: /reset 清空对话，/help 帮助，exit 退出
 """
 
 import argparse
+import base64
+import hashlib
+import hmac
 import json
 import os
 import platform
@@ -48,6 +57,9 @@ MAX_LINE_CHARS = 2000                # read_file 单行最大显示字符数
 MAX_READ_BYTES = 10 * 1024 * 1024    # 文件读写大小上限，防止内存被撑爆
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024  # 单次 HTTP 响应大小上限
 AGENT_FILE = "AGENTS.md"             # 当前目录下的约定文件（不区分大小写），存在则提示模型自行读取
+CONFIG_FILE = ".bo"                  # 当前目录下的参数记忆文件（加密），显式传参时写入、无参时复用
+# 只有这些「连接/运行类」参数会写入 .bo；交互与显示开关（--yes / -q / -v / --no-color）仅本次生效
+CONFIG_KEYS = ("model", "base_url", "api_key", "root", "max_steps", "http_timeout", "log_path")
 
 # 屏幕展示分级
 LEVEL_QUIET, LEVEL_NORMAL, LEVEL_VERBOSE, LEVEL_DEBUG = 0, 1, 2, 3
@@ -222,6 +234,115 @@ def find_agent_file():
                 return name
     except Exception:
         pass
+    return None
+
+
+# ---------------------------------------------------------------------------
+# .bo 参数记忆（简单加密：目录路径派生密钥流 XOR + HMAC-SHA256 校验）
+# ---------------------------------------------------------------------------
+
+_CFG_MAGIC = b"BOCFG1"
+_CFG_MAX_BYTES = 1 << 20             # .bo 大小上限 1MB
+
+
+def _cfg_keys(path):
+    """由 .bo 所在目录的真实路径派生 (密钥流密钥, 校验密钥)；文件因此与目录绑定。"""
+    base = os.path.dirname(os.path.realpath(path)).encode("utf-8")
+    return (hashlib.sha256(b"bo-config-stream-v1|" + base).digest(),
+            hashlib.sha256(b"bo-config-mac-v1|" + base).digest())
+
+
+def _cfg_keystream(key, n):
+    """用密钥派生 n 字节密钥流（SHA-256 计数器模式）。"""
+    out, i = bytearray(), 0
+    while len(out) < n:
+        out += hashlib.sha256(key + i.to_bytes(4, "big")).digest()
+        i += 1
+    return bytes(out[:n])
+
+
+def _cfg_xor(data, key):
+    return bytes(b ^ k for b, k in zip(bytearray(data), _cfg_keystream(key, len(data))))
+
+
+def _encrypt_config(raw_bytes, stream_key, mac_key):
+    """明文 -> base64(魔数 + HMAC-SHA256 + XOR 密文)。"""
+    body = _cfg_xor(raw_bytes, stream_key)
+    mac = hmac.new(mac_key, _CFG_MAGIC + body, hashlib.sha256).digest()
+    return base64.b64encode(_CFG_MAGIC + mac + body) + b"\n"
+
+
+def _decrypt_config(raw, stream_key, mac_key):
+    """解密；base64/魔数/HMAC/编码任一步失败返回 None（视为无有效配置）。"""
+    try:
+        blob = base64.b64decode(raw.strip(), validate=True)
+    except Exception:
+        return None
+    head = len(_CFG_MAGIC)
+    if len(blob) < head + 32 or not blob.startswith(_CFG_MAGIC):
+        return None
+    body, mac = blob[head + 32:], blob[head:head + 32]
+    expect = hmac.new(mac_key, _CFG_MAGIC + body, hashlib.sha256).digest()
+    if not hmac.compare_digest(mac, expect):
+        return None
+    try:
+        return _cfg_xor(body, stream_key).decode("utf-8")
+    except Exception:
+        return None
+
+
+def load_config(path):
+    """读取并解密 .bo。返回 (dict, status)，status ∈ 'missing' / 'ok' / 'invalid'。"""
+    if not os.path.isfile(path):
+        return {}, "missing"
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(_CFG_MAX_BYTES + 1)
+    except Exception:
+        return {}, "invalid"
+    if len(raw) > _CFG_MAX_BYTES:
+        return {}, "invalid"
+    stream_key, mac_key = _cfg_keys(path)
+    text = _decrypt_config(raw, stream_key, mac_key)
+    if text is None:
+        return {}, "invalid"
+    try:
+        obj = json.loads(text)
+    except Exception:
+        return {}, "invalid"
+    if not isinstance(obj, dict):
+        return {}, "invalid"
+    return {k: v for k, v in obj.items() if k in CONFIG_KEYS}, "ok"
+
+
+def save_config(cfg, path):
+    """加密写入 .bo（0600、原子替换）。返回错误信息，成功返回 None。"""
+    stream_key, mac_key = _cfg_keys(path)
+    try:
+        data = _encrypt_config(
+            json.dumps(cfg, ensure_ascii=False, sort_keys=True).encode("utf-8"),
+            stream_key, mac_key)
+    except Exception as e:
+        return "序列化失败: %s" % e
+    target = os.path.realpath(path)
+    try:
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(target) or ".",
+                                   prefix=".bo-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, target)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+            raise
+    except Exception as e:
+        return "写入失败: %s" % e
     return None
 
 
@@ -559,43 +680,113 @@ def run_turn(user_text, messages, opts, out):
 
 def parse_args():
     env = os.environ.get
+    S = argparse.SUPPRESS  # 用 SUPPRESS 区分「用户是否显式传了该 option」
     parser = argparse.ArgumentParser(
         description="BO —— 单文件、纯标准库的最小编码智能体",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="注意: --yes 的含义是「命令执行前需人工确认」。不加 --yes 时命令默认直接放行。")
-    parser.add_argument("--model", default=env("MODEL") or env("OPENAI_MODEL") or "gpt-4o-mini",
-                        help="模型名（默认取环境变量 MODEL / OPENAI_MODEL）")
-    parser.add_argument("--base-url", default=env("OPENAI_BASE_URL") or "https://api.openai.com/v1",
-                        help="OpenAI 兼容接口地址（默认取 OPENAI_BASE_URL）")
-    parser.add_argument("--api-key", default=env("OPENAI_API_KEY") or "",
-                        help="API 密钥（默认取 OPENAI_API_KEY）")
-    parser.add_argument("--yes", action="store_true",
+        epilog="注意: --yes 的含义是「命令执行前需人工确认」。不加 --yes 时命令默认直接放行。\n"
+               "显式传入的连接类参数（--model / --base-url / --api-key / --root / --max-steps / "
+               "--http-timeout / -l）会加密记录到当前目录的 .bo，之后不传参或只传部分参数时自动复用；"
+               "删除 .bo 即恢复默认。优先级: 命令行 > 环境变量 > .bo > 内置默认。")
+    parser.add_argument("-m", "--model", default=S,
+                        help="模型名（默认取环境变量 MODEL / OPENAI_MODEL，其次取 .bo）")
+    parser.add_argument("--base-url", default=S,
+                        help="OpenAI 兼容接口地址（默认取 OPENAI_BASE_URL，其次取 .bo）")
+    parser.add_argument("--api-key", default=S,
+                        help="API 密钥（默认取 OPENAI_API_KEY，其次取 .bo）")
+    parser.add_argument("--yes", action="store_true", dest="confirm",
                         help="开启命令执行前的逐条人工确认（不加则命令默认直接放行）")
-    parser.add_argument("--root", default=None, metavar="DIR",
+    parser.add_argument("--root", default=S, metavar="DIR",
                         help="限制 read_file/edit_file 只能访问该目录之内（默认不限制）")
-    parser.add_argument("--max-steps", type=int, default=50, help="单轮最多工具调用轮数")
-    parser.add_argument("--http-timeout", type=int, default=120, help="单次 HTTP 请求超时秒数")
+    parser.add_argument("--max-steps", type=int, default=S, help="单轮最多工具调用轮数")
+    parser.add_argument("--http-timeout", type=int, default=S, help="单次 HTTP 请求超时秒数")
     parser.add_argument("-q", "--quiet", action="store_true",
                         help="只显示最终答复，隐藏全部工具/思考过程")
     parser.add_argument("-v", "--verbose", action="count", default=0,
                         help="提高显示级别：-v 显示工具结果与思考，-vv 显示完整明细")
     parser.add_argument("--no-color", action="store_true",
                         help="关闭彩色输出（默认仅在终端下着色）")
-    parser.add_argument("-l", "--log", nargs="?", const="BO.log", default=None,
+    parser.add_argument("-l", "--log", nargs="?", const="BO.log", default=S, dest="log_path", metavar="FILE",
                         help="把完整交互记录写入日志文件（默认 BO.log），屏幕上不显示明细")
+    parser.add_argument("--no-log", action="store_const", const=None, default=S, dest="log_path",
+                        help="撤销已记录的 -l/--log，停止写日志")
     a = parser.parse_args()
+    a_vars = vars(a)
 
+    cfg_path = os.path.join(os.getcwd(), CONFIG_FILE)
+    cfg, cfg_status = load_config(cfg_path)
+    used_cfg = []  # 记录本次实际从 .bo 取值的键，用于启动提示
+
+    def pick(name, env_value, default):
+        """解析单个参数：显式 CLI > 环境变量 > .bo > 内置默认。"""
+        v = getattr(a, name, None)
+        if v is not None:
+            return v
+        if env_value is not None:
+            return env_value
+        if name in cfg:
+            used_cfg.append(name)
+            return cfg[name]
+        return default
+
+    model = pick("model", env("MODEL") or env("OPENAI_MODEL"), "gpt-4o-mini")
+    # 空字符串环境变量按「未设置」处理，否则会覆盖掉默认接口地址
+    base_url = pick("base_url", env("OPENAI_BASE_URL") or None, "https://api.openai.com/v1")
+    api_key = pick("api_key", env("OPENAI_API_KEY") or None, "")
+    root = pick("root", None, None)
+    root = os.path.realpath(root) if root else None
+    max_steps = pick("max_steps", None, 50)
+    http_timeout = pick("http_timeout", None, 120)
+
+    # 日志：-l/--log 设置，--no-log 显式清空（清空需与「未传参」区分，故单独处理）
+    if "log_path" in a_vars:
+        log_path = a_vars["log_path"]
+    elif "log_path" in cfg:
+        used_cfg.append("log_path")
+        log_path = cfg["log_path"]
+    else:
+        log_path = None
+
+    # 交互与显示开关仅本次生效，不写入 .bo
+    confirm = bool(a.confirm)
+    level = LEVEL_QUIET if a.quiet else min(LEVEL_NORMAL + a.verbose, LEVEL_DEBUG)
     try:
         color = (not a.no_color) and env("NO_COLOR") is None and sys.stdout.isatty()
     except Exception:
         color = False
 
+    # 只把本次显式传入的连接类参数写回 .bo，保留文件中其它键
+    updates = {}
+    if "model" in a_vars:
+        updates["model"] = model
+    if "base_url" in a_vars:
+        updates["base_url"] = base_url
+    if "api_key" in a_vars:
+        updates["api_key"] = api_key
+    if "root" in a_vars:
+        updates["root"] = root
+    if "max_steps" in a_vars:
+        updates["max_steps"] = max_steps
+    if "http_timeout" in a_vars:
+        updates["http_timeout"] = http_timeout
+    if "log_path" in a_vars:
+        updates["log_path"] = log_path
+
+    config_saved, config_error = False, None
+    if updates:
+        merged = dict(cfg)
+        merged.update(updates)
+        if merged != cfg:  # 无变化则不重写，避免无谓地改动文件
+            config_error = save_config(merged, cfg_path)
+            config_saved = config_error is None
+
     return {
-        "model": a.model, "base_url": a.base_url, "api_key": a.api_key,
-        "confirm": a.yes, "root": os.path.realpath(a.root) if a.root else None,
-        "max_steps": a.max_steps, "http_timeout": a.http_timeout, "cwd": os.getcwd(),
-        "level": LEVEL_QUIET if a.quiet else min(LEVEL_NORMAL + a.verbose, LEVEL_DEBUG),
-        "color": color, "log_path": a.log,
+        "model": model, "base_url": base_url, "api_key": api_key,
+        "confirm": confirm, "root": root,
+        "max_steps": max_steps, "http_timeout": http_timeout, "cwd": os.getcwd(),
+        "level": level, "color": color, "log_path": log_path,
+        "config_status": cfg_status, "config_saved": config_saved, "config_error": config_error,
+        "config_used": bool(used_cfg),
     }
 
 
@@ -620,6 +811,14 @@ def main():
         sys.stdout.write("文件访问限制: %s\n" % opts["root"])
     if out.log_path:
         sys.stdout.write("完整日志: %s\n" % out.log_path)
+    if opts["config_status"] == "invalid":
+        sys.stderr.write("警告: %s 存在但无法解密/解析（或不属于本目录），已忽略\n" % CONFIG_FILE)
+    if opts["config_used"]:
+        sys.stdout.write("参数记忆: 已从 %s 读取\n" % CONFIG_FILE)
+    if opts["config_saved"]:
+        sys.stdout.write("参数记忆: 已写入 %s\n" % CONFIG_FILE)
+    elif opts["config_error"]:
+        sys.stderr.write("警告: 写入 %s 失败: %s\n" % (CONFIG_FILE, opts["config_error"]))
     sys.stdout.write("输入 /help 查看帮助，exit 退出。\n")
 
     out.log("SESSION BEGIN", "编号: %d\nmodel=%s\nbase_url=%s\ncwd=%s\nlevel=%s" % (

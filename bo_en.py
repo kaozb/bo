@@ -14,7 +14,7 @@ Usage:
     python BO.py
 
 Options:
-    --model / --base-url / --api-key   override the corresponding environment variable
+    -m, --model / --base-url / --api-key   override the corresponding environment variable
     --yes               ask for manual confirmation before each command (without it, commands run directly)
     --root DIR          restrict read_file/edit_file to DIR only (unrestricted by default)
     --max-steps N       maximum number of tool-call rounds per turn (default 50)
@@ -23,11 +23,21 @@ Options:
     -v / -vv            show tool results and thinking / full detail
     --no-color          disable colored output
     -l, --log [FILE]    write the full interaction to a log file (default BO.log), no detail on screen
+    --no-log            undo a recorded -l/--log and stop writing a log
+
+Parameter memory: explicitly passed connection options (-m / --base-url / --api-key / --root /
+                  --max-steps / --http-timeout / -l) are encrypted into .bo in the current directory
+                  and reused when omitted or only partially passed. Interaction and display switches
+                  (--yes / -q / -v / --no-color) apply to this run only and are not written there.
+                  Precedence: command line > environment variable > .bo > built-in default. Delete .bo to reset.
 
 Interaction: /reset clears the conversation, /help shows help, exit quits
 """
 
 import argparse
+import base64
+import hashlib
+import hmac
 import json
 import os
 import platform
@@ -49,6 +59,9 @@ MAX_LINE_CHARS = 2000                # max characters displayed per line by read
 MAX_READ_BYTES = 10 * 1024 * 1024    # read/write size limit to avoid blowing up memory
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024  # max size of a single HTTP response
 AGENT_FILE = "AGENTS.md"             # convention file in the current directory (case-insensitive); if present, the model is told to read it
+CONFIG_FILE = ".bo"                  # encrypted parameter memory in the current directory; written on explicit options, reused when omitted
+# only these connection/run options are written to .bo; interaction and display switches (--yes / -q / -v / --no-color) apply to this run only
+CONFIG_KEYS = ("model", "base_url", "api_key", "root", "max_steps", "http_timeout", "log_path")
 
 # Screen verbosity levels
 LEVEL_QUIET, LEVEL_NORMAL, LEVEL_VERBOSE, LEVEL_DEBUG = 0, 1, 2, 3
@@ -223,6 +236,115 @@ def find_agent_file():
                 return name
     except Exception:
         pass
+    return None
+
+
+# ---------------------------------------------------------------------------
+# .bo parameter memory (simple encryption: directory-path-derived keystream XOR + HMAC-SHA256)
+# ---------------------------------------------------------------------------
+
+_CFG_MAGIC = b"BOCFG1"
+_CFG_MAX_BYTES = 1 << 20             # .bo size limit, 1MB
+
+
+def _cfg_keys(path):
+    """Derive (stream key, MAC key) from the real path of the directory holding .bo, binding the file to it."""
+    base = os.path.dirname(os.path.realpath(path)).encode("utf-8")
+    return (hashlib.sha256(b"bo-config-stream-v1|" + base).digest(),
+            hashlib.sha256(b"bo-config-mac-v1|" + base).digest())
+
+
+def _cfg_keystream(key, n):
+    """Derive n bytes of keystream from the key (SHA-256 counter mode)."""
+    out, i = bytearray(), 0
+    while len(out) < n:
+        out += hashlib.sha256(key + i.to_bytes(4, "big")).digest()
+        i += 1
+    return bytes(out[:n])
+
+
+def _cfg_xor(data, key):
+    return bytes(b ^ k for b, k in zip(bytearray(data), _cfg_keystream(key, len(data))))
+
+
+def _encrypt_config(raw_bytes, stream_key, mac_key):
+    """Plaintext -> base64(magic + HMAC-SHA256 + XOR ciphertext)."""
+    body = _cfg_xor(raw_bytes, stream_key)
+    mac = hmac.new(mac_key, _CFG_MAGIC + body, hashlib.sha256).digest()
+    return base64.b64encode(_CFG_MAGIC + mac + body) + b"\n"
+
+
+def _decrypt_config(raw, stream_key, mac_key):
+    """Decrypt; return None if any step (base64/magic/HMAC/decoding) fails (treated as no valid config)."""
+    try:
+        blob = base64.b64decode(raw.strip(), validate=True)
+    except Exception:
+        return None
+    head = len(_CFG_MAGIC)
+    if len(blob) < head + 32 or not blob.startswith(_CFG_MAGIC):
+        return None
+    body, mac = blob[head + 32:], blob[head:head + 32]
+    expect = hmac.new(mac_key, _CFG_MAGIC + body, hashlib.sha256).digest()
+    if not hmac.compare_digest(mac, expect):
+        return None
+    try:
+        return _cfg_xor(body, stream_key).decode("utf-8")
+    except Exception:
+        return None
+
+
+def load_config(path):
+    """Read and decrypt .bo. Return (dict, status) where status is 'missing' / 'ok' / 'invalid'."""
+    if not os.path.isfile(path):
+        return {}, "missing"
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(_CFG_MAX_BYTES + 1)
+    except Exception:
+        return {}, "invalid"
+    if len(raw) > _CFG_MAX_BYTES:
+        return {}, "invalid"
+    stream_key, mac_key = _cfg_keys(path)
+    text = _decrypt_config(raw, stream_key, mac_key)
+    if text is None:
+        return {}, "invalid"
+    try:
+        obj = json.loads(text)
+    except Exception:
+        return {}, "invalid"
+    if not isinstance(obj, dict):
+        return {}, "invalid"
+    return {k: v for k, v in obj.items() if k in CONFIG_KEYS}, "ok"
+
+
+def save_config(cfg, path):
+    """Encrypt and write .bo (0600, atomic replace). Return an error message, or None on success."""
+    stream_key, mac_key = _cfg_keys(path)
+    try:
+        data = _encrypt_config(
+            json.dumps(cfg, ensure_ascii=False, sort_keys=True).encode("utf-8"),
+            stream_key, mac_key)
+    except Exception as e:
+        return "serialization failed: %s" % e
+    target = os.path.realpath(path)
+    try:
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(target) or ".",
+                                   prefix=".bo-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, target)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+            raise
+    except Exception as e:
+        return "write failed: %s" % e
     return None
 
 
@@ -563,43 +685,114 @@ def run_turn(user_text, messages, opts, out):
 
 def parse_args():
     env = os.environ.get
+    S = argparse.SUPPRESS  # use SUPPRESS to tell whether the user explicitly passed an option
     parser = argparse.ArgumentParser(
         description="BO -- a single-file, standard-library-only minimal coding agent",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Note: --yes means \"ask for manual confirmation before each command\". Without --yes commands run directly.")
-    parser.add_argument("--model", default=env("MODEL") or env("OPENAI_MODEL") or "gpt-4o-mini",
-                        help="model name (defaults to the MODEL / OPENAI_MODEL environment variable)")
-    parser.add_argument("--base-url", default=env("OPENAI_BASE_URL") or "https://api.openai.com/v1",
-                        help="OpenAI-compatible endpoint URL (defaults to OPENAI_BASE_URL)")
-    parser.add_argument("--api-key", default=env("OPENAI_API_KEY") or "",
-                        help="API key (defaults to OPENAI_API_KEY)")
-    parser.add_argument("--yes", action="store_true",
+        epilog="Note: --yes means \"ask for manual confirmation before each command\". Without --yes commands run directly.\n"
+               "Explicitly passed connection options (--model / --base-url / --api-key / --root / --max-steps / "
+               "--http-timeout / -l) are encrypted into .bo in the current directory and reused later when omitted "
+               "or only partially passed; delete .bo to reset. "
+               "Precedence: command line > environment variable > .bo > built-in default.")
+    parser.add_argument("-m", "--model", default=S,
+                        help="model name (defaults to MODEL / OPENAI_MODEL, then .bo)")
+    parser.add_argument("--base-url", default=S,
+                        help="OpenAI-compatible endpoint URL (defaults to OPENAI_BASE_URL, then .bo)")
+    parser.add_argument("--api-key", default=S,
+                        help="API key (defaults to OPENAI_API_KEY, then .bo)")
+    parser.add_argument("--yes", action="store_true", dest="confirm",
                         help="ask for manual confirmation before each command (without it commands run directly)")
-    parser.add_argument("--root", default=None, metavar="DIR",
+    parser.add_argument("--root", default=S, metavar="DIR",
                         help="restrict read_file/edit_file to this directory only (unrestricted by default)")
-    parser.add_argument("--max-steps", type=int, default=50, help="maximum number of tool-call rounds per turn")
-    parser.add_argument("--http-timeout", type=int, default=120, help="timeout in seconds for a single HTTP request")
+    parser.add_argument("--max-steps", type=int, default=S, help="maximum number of tool-call rounds per turn")
+    parser.add_argument("--http-timeout", type=int, default=S, help="timeout in seconds for a single HTTP request")
     parser.add_argument("-q", "--quiet", action="store_true",
                         help="show only the final answer, hide all tool/thinking output")
     parser.add_argument("-v", "--verbose", action="count", default=0,
                         help="raise the display level: -v shows tool results and thinking, -vv shows full detail")
     parser.add_argument("--no-color", action="store_true",
                         help="disable colored output (colors are used only on a terminal by default)")
-    parser.add_argument("-l", "--log", nargs="?", const="BO.log", default=None,
+    parser.add_argument("-l", "--log", nargs="?", const="BO.log", default=S, dest="log_path", metavar="FILE",
                         help="write the full interaction to a log file (default BO.log), no detail on screen")
+    parser.add_argument("--no-log", action="store_const", const=None, default=S, dest="log_path",
+                        help="undo a recorded -l/--log and stop writing a log")
     a = parser.parse_args()
+    a_vars = vars(a)
 
+    cfg_path = os.path.join(os.getcwd(), CONFIG_FILE)
+    cfg, cfg_status = load_config(cfg_path)
+    used_cfg = []  # keys actually taken from .bo this run, for the startup notice
+
+    def pick(name, env_value, default):
+        """Resolve one option: explicit CLI > environment variable > .bo > built-in default."""
+        v = getattr(a, name, None)
+        if v is not None:
+            return v
+        if env_value is not None:
+            return env_value
+        if name in cfg:
+            used_cfg.append(name)
+            return cfg[name]
+        return default
+
+    model = pick("model", env("MODEL") or env("OPENAI_MODEL"), "gpt-4o-mini")
+    # an empty environment variable counts as unset, otherwise it would blank the default endpoint
+    base_url = pick("base_url", env("OPENAI_BASE_URL") or None, "https://api.openai.com/v1")
+    api_key = pick("api_key", env("OPENAI_API_KEY") or None, "")
+    root = pick("root", None, None)
+    root = os.path.realpath(root) if root else None
+    max_steps = pick("max_steps", None, 50)
+    http_timeout = pick("http_timeout", None, 120)
+
+    # log: -l/--log sets it, --no-log clears it explicitly (clearing must be told apart from "not passed")
+    if "log_path" in a_vars:
+        log_path = a_vars["log_path"]
+    elif "log_path" in cfg:
+        used_cfg.append("log_path")
+        log_path = cfg["log_path"]
+    else:
+        log_path = None
+
+    # interaction and display switches apply to this run only and are not written to .bo
+    confirm = bool(a.confirm)
+    level = LEVEL_QUIET if a.quiet else min(LEVEL_NORMAL + a.verbose, LEVEL_DEBUG)
     try:
         color = (not a.no_color) and env("NO_COLOR") is None and sys.stdout.isatty()
     except Exception:
         color = False
 
+    # write back only the connection options explicitly passed this run, preserving other keys in .bo
+    updates = {}
+    if "model" in a_vars:
+        updates["model"] = model
+    if "base_url" in a_vars:
+        updates["base_url"] = base_url
+    if "api_key" in a_vars:
+        updates["api_key"] = api_key
+    if "root" in a_vars:
+        updates["root"] = root
+    if "max_steps" in a_vars:
+        updates["max_steps"] = max_steps
+    if "http_timeout" in a_vars:
+        updates["http_timeout"] = http_timeout
+    if "log_path" in a_vars:
+        updates["log_path"] = log_path
+
+    config_saved, config_error = False, None
+    if updates:
+        merged = dict(cfg)
+        merged.update(updates)
+        if merged != cfg:  # skip rewriting when nothing changed, to avoid needless file churn
+            config_error = save_config(merged, cfg_path)
+            config_saved = config_error is None
+
     return {
-        "model": a.model, "base_url": a.base_url, "api_key": a.api_key,
-        "confirm": a.yes, "root": os.path.realpath(a.root) if a.root else None,
-        "max_steps": a.max_steps, "http_timeout": a.http_timeout, "cwd": os.getcwd(),
-        "level": LEVEL_QUIET if a.quiet else min(LEVEL_NORMAL + a.verbose, LEVEL_DEBUG),
-        "color": color, "log_path": a.log,
+        "model": model, "base_url": base_url, "api_key": api_key,
+        "confirm": confirm, "root": root,
+        "max_steps": max_steps, "http_timeout": http_timeout, "cwd": os.getcwd(),
+        "level": level, "color": color, "log_path": log_path,
+        "config_status": cfg_status, "config_saved": config_saved, "config_error": config_error,
+        "config_used": bool(used_cfg),
     }
 
 
@@ -624,6 +817,14 @@ def main():
         sys.stdout.write("File access restriction: %s\n" % opts["root"])
     if out.log_path:
         sys.stdout.write("Full log: %s\n" % out.log_path)
+    if opts["config_status"] == "invalid":
+        sys.stderr.write("Warning: %s exists but cannot be decrypted/parsed (or belongs to another directory); ignored\n" % CONFIG_FILE)
+    if opts["config_used"]:
+        sys.stdout.write("Parameter memory: loaded from %s\n" % CONFIG_FILE)
+    if opts["config_saved"]:
+        sys.stdout.write("Parameter memory: written to %s\n" % CONFIG_FILE)
+    elif opts["config_error"]:
+        sys.stderr.write("Warning: failed to write %s: %s\n" % (CONFIG_FILE, opts["config_error"]))
     sys.stdout.write("Type /help for help, exit to quit.\n")
 
     out.log("SESSION BEGIN", "number: %d\nmodel=%s\nbase_url=%s\ncwd=%s\nlevel=%s" % (
