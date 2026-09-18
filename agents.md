@@ -202,12 +202,32 @@ README 中英两节均已补：特性里加 Ctrl+C 一行、`-r` 行注明「默
   提示符 `you >`、四处文案断言、`import bo_en as bo` 生成）全过；
 - `/tmp/test_trim.py` 6 场景通过。
 
+## Python 3.6 真机实测（Docker，已完成）
+
+本机有 docker，可拉 `python:3.6-slim`（跑出来是 Python 3.6.15）真机验证，命令模式：
+
+```bash
+docker run --rm --network host -v /root/bo:/root/bo -w /root/bo python:3.6-slim \
+  sh -c 'printf "退出\n" | python bo.py -C -b <url> -k <key> -m <model> -r /root/bo -v'
+```
+
+- 用 `-v /root/bo:/root/bo` 做**相同路径映射**，这样 `-r /root/bo` 与 `.bo` 里记的 root 在容器内外一致，
+  不涉及路径改写；`--network host` 是为了让容器直连宿主上的假接口（127.0.0.1:8899）。
+- 实测结论（2025-09-19，中文版 + 英文版）：启动自检、UTF-8 中文输出、四大工具全部正常 ——
+  read_file（带行号 + 续读）、write_file 双模式（含 diff 回显）、search、run_command（含管道/中文输出）。
+- `.bo` 跨版本双向可用：3.6 能解密本机 3.11（3.11 用 `hashlib.scrypt`，3.6 走 `pbkdf2_hmac` 兼容分支）
+  写下的 `.bo`，3.11 也能读回 3.6 写的 `.bo`；文件权限保持 0600，内容格式不变。
+- 注意：容器里跑会**改写工作目录的 `.bo`**（`-b/-k/-m/-r` 会被记忆）。真机验证前先
+  `cp .bo /tmp/bo.conf.bak`，验证后 `cp /tmp/bo.conf.bak .bo` 还原，并删掉探针目录（如 `tmp_probe/`）。
+- 假接口脚本在 `/tmp/fake_llm.py`（不入库，工作目录按 `/root/bo` 写死）：仅标准库 http.server + SSE，
+  按脚本顺序吐出预设 tool_calls，用来在没有真实 API key 的情况下走通全流程。
+
 ## 待办
 
 - 无（下次动 bo.py 后仍按「先只改 bo.py、提交前再同步 bo_en.py / README」的老流程走）。
 
 ## 环境
 
-- 开发机：Linux armv7l，Python 3.11.2（但代码需向下兼容 3.6；本机没有 3.6，只能用
-  `tools/py36check.py` 做 API 引入版本核对 + 语法扫描，无法真机验证）
+- 开发机：Linux armv7l，Python 3.11.2（但代码需向下兼容 3.6）。本机 shell 里没有 3.6，
+  `tools/py36check.py`（API 引入版本核对 + 语法扫描）仍是日常快检手段；需要真机时用下面的 Docker 方案。
 - 运行参数记忆优先顺序：命令行 > 环境变量 > `.bo` > 内置默认
