@@ -11,6 +11,7 @@
 - 单文件、零依赖，Python 3.6+
 - 四个工具：`read_file` / `write_file`（整体写入与精确替换双模式）/ `search` / `run_command`
 - 对话历史自动瘦身：每轮只保留最近一轮的工具调用与结果，更早的自动移除
+- Ctrl+C 第一次只中断当前一轮（生成中或命令执行中），再按一次退出程序；中断不打乱对话历史
 - 分级输出：`-q` / `-v` / `-vv`
 - 完整交互日志落盘（0600，仅本人可读）
 - `-r, --root` 限制文件访问范围，`-y, --yes` 命令逐条确认
@@ -69,7 +70,7 @@ python3 bo_en.py -r ~/project -y -v -l session.log -m deepseek-chat
 | `-b, --base-url URL` | 接口地址；默认取 `OPENAI_BASE_URL` |
 | `-k, --api-key KEY` | 密钥；默认取 `OPENAI_API_KEY` |
 | `-y, --yes` | 命令执行前逐条人工确认（不加则直接放行） |
-| `-r, --root DIR` | 限制文件类工具（`read_file` / `write_file` / `search`）与 `run_command` 的 `cwd` 只能访问 `DIR` 之内 |
+| `-r, --root DIR` | 限制文件类工具（`read_file` / `write_file` / `search`）与 `run_command` 的 `cwd`（含未显式指定时的默认工作目录）只能访问 `DIR` 之内 |
 | `-s, --max-steps N` | 单轮最多工具调用轮数，默认 50 |
 | `-t, --http-timeout N` | 单次请求超时秒数，默认 120 |
 | `-q` / `-v` / `-vv` | 只显示最终答复 / 工具结果与思考 / 完整明细 |
@@ -95,6 +96,7 @@ python3 bo_en.py -r ~/project -y -v -l session.log -m deepseek-chat
 | `/reset` | 清空对话历史 |
 | `/help` | 显示帮助 |
 | `exit` | 退出（`quit` / `/exit` / `/quit` 亦可） |
+| `Ctrl+C` | 第一次只中断当前一轮（生成中或命令执行中）并回到提示符，再按一次退出程序；命令被中断时会连同派生进程一起清理 |
 
 ## 约定文件
 
@@ -113,6 +115,7 @@ A single-file, standard-library-only minimal coding agent. Any machine running P
 - Single file, zero dependencies, Python 3.6+
 - Four tools: `read_file` / `write_file` (whole-file write and exact replacement in one) / `search` / `run_command`
 - Automatic history slimming: each turn keeps only the most recent turn's tool calls and results, earlier ones are dropped
+- Ctrl+C interrupts the current turn on the first press (generation or running command) and quits on the second; an interrupt never corrupts the conversation history
 - Tiered output: `-q` / `-v` / `-vv`
 - Full interaction log on disk (0600, owner-only)
 - `-r, --root` to restrict file access, `-y, --yes` to confirm each command
@@ -171,7 +174,7 @@ Every common option accepts both a short and a long form, e.g. `-b` is the same 
 | `-b, --base-url URL` | endpoint URL; defaults to `OPENAI_BASE_URL` |
 | `-k, --api-key KEY` | API key; defaults to `OPENAI_API_KEY` |
 | `-y, --yes` | ask for confirmation before each command (without it, commands run directly) |
-| `-r, --root DIR` | restrict the file tools (`read_file` / `write_file` / `search`) and the `run_command` `cwd` to `DIR` |
+| `-r, --root DIR` | restrict the file tools (`read_file` / `write_file` / `search`) and the `run_command` `cwd` (including the default working directory when none is given) to `DIR` |
 | `-s, --max-steps N` | max tool-call rounds per turn, default 50 |
 | `-t, --http-timeout N` | per-request timeout in seconds, default 120 |
 | `-q` / `-v` / `-vv` | final answer only / tool results and thinking / full detail |
@@ -197,6 +200,7 @@ Precedence: **command line > environment variable > `.bo` > built-in default**. 
 | `/reset` | clear the conversation |
 | `/help` | show help |
 | `exit` | quit (`quit` / `/exit` / `/quit` also work) |
+| `Ctrl+C` | the first press interrupts the current turn (generation or running command) and returns to the prompt, the second quits; an interrupted command is cleaned up together with its spawned processes |
 
 ## Convention File
 

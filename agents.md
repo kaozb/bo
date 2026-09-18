@@ -102,6 +102,24 @@ BO 是一个单文件、纯标准库的最小编码智能体，通过 OpenAI 兼
 - 测试脚本在 `/tmp/test_trim.py`（6 个场景，不入库）；改动后用 `python3 /tmp/test_trim.py` 复验，
   或至少确认「单轮不裁剪 / 幂等 / 保留段 tool_call_id 与 tool_calls 成对」。
 
+## Ctrl+C 语义（本轮新增，只动 bo.py）
+
+- `TurnInterrupted(BaseException)` + `_INTERRUPT = {"busy", "seen"}` + `_handle_sigint` /
+  `install_sigint_handler`（放在顶部常量区下方）：**一轮之内第一次 Ctrl+C 只中断本轮，第二次
+  （或空闲时按一次）退出程序**。必须继承 BaseException，否则会被 `call_llm` 里的
+  `except Exception`（转成「读取流式响应失败」RuntimeError）等地方吞掉。
+- `run_turn` 开头置 `busy=True, seen=False`，main 的 `finally` 复位 busy，所以计数是每轮独立的。
+- 中断落点三处：`call_llm` 调用处（assistant 消息还没入历史，直接 return）；工具循环内
+  `execute_tool` 处（复用 aborted / abort_note / abort_info，给未执行的 tool_calls 补结果）；
+  main 的兜底 `except TurnInterrupted`（用 `_close_dangling_tool_calls` 补 assistant.tool_calls
+  缺的 tool 结果，免得下一轮被接口判成格式错误）。
+- `tool_run_command` 的 `proc.wait` 增加 `except TurnInterrupted: _terminate_group(proc); raise`，
+  中断长命令时不留派生进程。
+- 空闲（等输入）时按 Ctrl+C 仍是退出；`/help` 加了一行说明。
+- 测试脚本 `/tmp/test_sigint.py`（不入库）：假 SSE 服务 + 子进程发真信号，覆盖「生成中中断 /
+  二次退出 / 空闲退出 / 命令执行中中断且清理 sleep 子进程 / 中断后会话仍正常」。改动后用
+  `python3 /tmp/test_sigint.py` 复验（约 30s）。
+
 ## 常用验证命令
 
 ```bash
@@ -133,9 +151,60 @@ git status --short                                      # 提交前检查
   `grep -n "^def \|^class \|^    def \|^[A-Z_][A-Z_0-9]* = " bo.py|sed 's/ *#.*//'|cut -d: -f2- > /tmp/a.sym`
   对 bo_en.py 同样处理再 `diff /tmp/a.sym /tmp/b.sym`。
 
+## bo.py 缺陷审查与修复（本轮，只动 bo.py）
+
+用 `/tmp/audit_bo.py`（临时，不入库）实测出 6 个缺陷，已在 bo.py 修掉：
+
+1. `_atomic_write` 的清理改为 `except BaseException`：Ctrl+C 抛的是 BaseException，原来会跳过
+   unlink，在工作目录残留 `.bo-*.tmp`（已复现）。
+2. `tool_run_command` 的 `proc.wait` 同时捕获 `KeyboardInterrupt` 再 `_terminate_group`：原来只有
+   TurnInterrupted 会清理进程组，本轮第二次 Ctrl+C（退出）会把 `sleep 30` 这类派生进程留成孤儿（已复现）。
+3. `_confirm` 不再把 Ctrl+C 当「拒绝」：只捕 EOFError，KeyboardInterrupt 交给 `_handle_sigint`
+   决定（第一次中断本轮、第二次退出）。原来在命令确认提示符处按第二次 Ctrl+C 会被吞成答案 "n"。
+4. `tool_run_command` 的**默认 cwd**（启动目录）也要过 `--root` 校验：原来只校验显式传入的 cwd，
+   `-r DIR` 但从 DIR 之外启动时，不带 cwd 的命令可在任意目录跑，与 `-r` 的帮助文案不符。现在返回
+   「默认工作目录 ... 越出允许范围」并提示先 cd 或用显式 cwd（`-r` 与启动目录相同时无感）。
+5. `run_turn` 里 `assistant.content` 统一写成 `msg.get("content") or ""`：非流式回退
+   （`_parse_full_response`）可能给出 `content: null`，直接回传会被部分服务端判为格式错误。
+6. `main` 的 while 循环外补一层 `except KeyboardInterrupt`：在错误/中断的收尾处理里再按一次 Ctrl+C，
+   原来会带 traceback 退出（except 处理块内抛出的异常不会被同一个 try 的其它 except 接住）。
+
+验证：`regress.py` + `/tmp/test_sigint.py` + `/tmp/test_trim.py` 全过，`/tmp/audit_bo.py` 六项全 ok，
+`py_compile` + `py36check.py` 通过；`/tmp/t_main_kb.py` 专门验证第 6 条（mock 掉 run_turn 与 Output.error）。
+
+评估过但有意不改（影响小 / 只是统计口径）：
+
+- search 输出预算耗尽时 `matched` 计数会大于实际输出的行数；
+- 目标是单个文件时 search 忽略 glob；
+- `.bo` 里 `max_steps` / `http_timeout` 被手工改成非数字类型时不做校验（只有本机可写，风险低）。
+
+## 双语同步与本轮提交（已完成）
+
+bo.py 的两批改动（Ctrl+C 语义 + 上面的 6 处修复）已按结构逐处移植到 bo_en.py：
+
+- 常量区下方：`TurnInterrupted(BaseException)` / `_INTERRUPT` / `_handle_sigint` / `install_sigint_handler`；
+- `_confirm` 只捕 EOFError；`_atomic_write` 的 `except BaseException`；
+- `tool_run_command` 的 `elif opts.get("root")` 默认 cwd 校验 + `proc.wait` 的
+  `except (TurnInterrupted, KeyboardInterrupt): _terminate_group; raise`；
+- `_close_dangling_tool_calls`（放在 `_trim_history` 之后、`run_turn` 之前）；
+- `run_turn`：`_INTERRUPT["busy"]/["seen"]` 置位、`call_llm` 的 `interrupted` 分支、
+  `abort_note`/`abort_info`、`execute_tool` 的 TurnInterrupted 分支、`content or ""`、`out.info("\n[%s]" % abort_info)`；
+- `main`：`install_sigint_handler()`、`/help` 的 Ctrl+C 行、`except KeyboardInterrupt` / `except TurnInterrupted`、
+  `finally: _INTERRUPT["busy"] = False`、while 外层兜底 `except KeyboardInterrupt`。
+
+README 中英两节均已补：特性里加 Ctrl+C 一行、`-r` 行注明「默认工作目录同样受限」、交互命令表加 Ctrl+C 行。
+
+验证记录（本轮实测全过）：
+
+- `py_compile` / `tools/py36check.py` / `tools/regress.py`；符号表 diff 只剩 `LEVEL_NAMES` 一行（预期）；
+- `/tmp/equiv.py` 全部等价；
+- `/tmp/test_sigint.py`（中文版全过）+ `/tmp/test_sigint_en.py`（英文版，由前者替换 BO 路径、
+  提示符 `you >`、四处文案断言、`import bo_en as bo` 生成）全过；
+- `/tmp/test_trim.py` 6 场景通过。
+
 ## 待办
 
-- 无。
+- 无（下次动 bo.py 后仍按「先只改 bo.py、提交前再同步 bo_en.py / README」的老流程走）。
 
 ## 环境
 
