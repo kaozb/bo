@@ -89,6 +89,38 @@ LEVEL_NAMES = ("quiet (final answer only)", "normal (one-line tool call notice)"
 
 
 # ---------------------------------------------------------------------------
+# Ctrl+C semantics: the first press interrupts the current turn (generation or
+# command), the second one quits the program
+# ---------------------------------------------------------------------------
+
+class TurnInterrupted(BaseException):
+    """Raised on the first Ctrl+C: end only this turn, back to the prompt, no exit.
+
+    Inherits BaseException so it is not swallowed as an ordinary error by the
+    `except Exception` blocks along the way.
+    """
+
+
+# busy means "inside a turn", seen means Ctrl+C was already pressed once during this turn
+_INTERRUPT = {"busy": False, "seen": False}
+
+
+def _handle_sigint(signum, frame):
+    if _INTERRUPT["busy"] and not _INTERRUPT["seen"]:
+        _INTERRUPT["seen"] = True
+        raise TurnInterrupted()     # first press within a turn: interrupt this turn only
+    raise KeyboardInterrupt()       # idle, or a second press within a turn: quit the program
+
+
+def install_sigint_handler():
+    """Take over SIGINT; if that is impossible (non-main thread etc.), keep the default behaviour."""
+    try:
+        signal.signal(signal.SIGINT, _handle_sigint)
+    except (ValueError, OSError):
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Tool definitions (OpenAI function calling format)
 # ---------------------------------------------------------------------------
 
@@ -248,12 +280,16 @@ def _is_error(result):
 
 
 def _confirm(prompt):
-    """Ask the user yes/no; anything other than y/yes counts as declined (including EOF and Ctrl-C)."""
+    """Ask the user yes/no; anything other than y/yes counts as declined (EOF/EOT included).
+
+    Ctrl+C is not swallowed here: it goes to _handle_sigint -- the first press in a turn
+    interrupts that turn only, the second one quits the program.
+    """
     sys.stdout.write(prompt)
     sys.stdout.flush()
     try:
         ans = input().strip().lower()
-    except (EOFError, KeyboardInterrupt):
+    except EOFError:
         ans = "n"
     return ans in ("y", "yes")
 
@@ -326,7 +362,7 @@ def _atomic_write(path, data, mode=None):
             os.fsync(f.fileno())
         os.chmod(tmp, mode)
         os.replace(tmp, target)
-    except Exception:
+    except BaseException:  # includes Ctrl+C (BaseException); no temp file may be left behind
         try:
             os.unlink(tmp)
         except Exception:
@@ -1064,6 +1100,12 @@ def tool_run_command(args, opts):
             return err
         if not os.path.isdir(cwd):
             return "Error: cwd is not a directory: %s" % args.get("cwd")
+    elif opts.get("root"):
+        # the default cwd (startup directory) must respect --root too, otherwise "inside DIR only" means nothing
+        cwd, err = _resolve(cwd, opts)
+        if err:
+            return ("Error: the default working directory %s is outside the allowed range (--root %s). "
+                    "cd into that directory before starting, or pass cwd explicitly." % (opts["cwd"], opts["root"]))
 
     if opts["confirm"] and not _confirm("\n[Command to run]%s %s\nExecute? [y/N] " % (
             " (cwd=%s)" % cwd if cwd != opts["cwd"] else "", command)):
@@ -1090,6 +1132,9 @@ def tool_run_command(args, opts):
     timed_out = False
     try:
         proc.wait(timeout=timeout)
+    except (TurnInterrupted, KeyboardInterrupt):
+        _terminate_group(proc)      # on any Ctrl+C (interrupt or quit) leave no spawned process behind
+        raise
     except subprocess.TimeoutExpired:
         timed_out = True
         _terminate_group(proc)
@@ -1463,8 +1508,27 @@ def _trim_history(messages, keep_turns=TRIM_KEEP_TURNS):
     return dropped
 
 
+def _close_dangling_tool_calls(messages, note):
+    """Append a result for the batch of tool_calls that has none, keeping the history valid.
+
+    An interrupt/exception outside the tool loop leaves an assistant tool_calls message in the
+    history with nobody answering it; the next request would be rejected as malformed, so the
+    missing results are filled in here. Returns how many were added.
+    """
+    answered = set(m.get("tool_call_id") for m in messages if m.get("role") == "tool")
+    for m in reversed(messages):
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            pending = [tc for tc in m["tool_calls"] if tc.get("id") not in answered]
+            for tc in pending:
+                messages.append({"role": "tool", "tool_call_id": tc.get("id"), "content": note})
+            return len(pending)
+    return 0
+
+
 def run_turn(user_text, messages, opts, out):
     out.log("USER", user_text)
+    # the first Ctrl+C within a turn interrupts this turn only (see _handle_sigint); main resets busy at the end
+    _INTERRUPT["busy"], _INTERRUPT["seen"] = True, False
     # trim before every turn: only the last keep_turns turns keep their tool round trips, earlier ones are removed
     dropped = _trim_history(messages)
     if dropped:
@@ -1494,9 +1558,16 @@ def run_turn(user_text, messages, opts, out):
 
         try:
             msg = call_llm(messages, opts, on_delta)
+            interrupted = False
+        except TurnInterrupted:
+            interrupted = True
         finally:
             if cur_kind["v"] is not None:
                 out.stream_end()
+        if interrupted:
+            # interrupted mid-generation: the assistant message never entered the history, so just end the turn
+            out.info("\n[generation interrupted, this turn ends here; press Ctrl+C again to quit]")
+            return
 
         content = msg.get("content") or ""
         reasoning = msg.get("reasoning_content") or msg.get("reasoning") or ""
@@ -1512,7 +1583,8 @@ def run_turn(user_text, messages, opts, out):
         if content and out.level == LEVEL_QUIET and not tool_calls:
             out.assistant(content, True)
 
-        assistant_msg = {"role": "assistant", "content": msg.get("content")}
+        # content is always a string: the non-streaming fallback may give null, which some servers reject
+        assistant_msg = {"role": "assistant", "content": msg.get("content") or ""}
         if tool_calls:
             assistant_msg["tool_calls"] = tool_calls
         messages.append(assistant_msg)
@@ -1520,13 +1592,14 @@ def run_turn(user_text, messages, opts, out):
             return
 
         aborted = False
+        abort_note = abort_info = ""
         for tc in tool_calls:
             fn = tc.get("function") or {}
             name, raw_args = fn.get("name"), fn.get("arguments") or "{}"
             out.log("TOOL_CALL " + (name or "?"), raw_args)
             out.tool_call(name, raw_args)
             if aborted:
-                result = "Error: this turn was aborted after repeated identical calls, this call was not executed."
+                result = abort_note
                 messages.append({"role": "tool", "tool_call_id": tc.get("id"), "content": result})
                 continue
 
@@ -1537,6 +1610,8 @@ def run_turn(user_text, messages, opts, out):
                 repeat["key"], repeat["n"] = key, 1
             if repeat["n"] >= MAX_REPEAT_CALLS:
                 aborted = True
+                abort_note = "Error: this turn was aborted after repeated identical calls, this call was not executed."
+                abort_info = "%d identical calls in a row detected, this turn stops here" % MAX_REPEAT_CALLS
                 result = ("Error: the identical %s call was repeated %d times in a row; this turn was aborted and "
                           "this call was not executed. Try a different approach or state your conclusion."
                           % (name, repeat["n"]))
@@ -1548,14 +1623,23 @@ def run_turn(user_text, messages, opts, out):
                 except ValueError as e:
                     result = "Error: cannot parse the tool argument JSON: %s" % e
                 else:
-                    result = execute_tool(name, args, opts)
+                    try:
+                        result = execute_tool(name, args, opts)
+                    except TurnInterrupted:
+                        # interrupted halfway through a tool: the result cannot be trusted, and the
+                        # remaining calls are not run either
+                        result = ("Error: the user pressed Ctrl+C during this turn, so this call did not finish "
+                                  "normally; do not call more tools and wait for the user's next instruction.")
+                        aborted = True
+                        abort_note = "Error: this turn was interrupted by Ctrl+C, this call was not executed."
+                        abort_info = "this turn was interrupted (Ctrl+C); press Ctrl+C again to quit"
 
             out.log("TOOL_RESULT " + (name or "?"), result)
             out.tool_result(result, _is_error(result))
             messages.append({"role": "tool", "tool_call_id": tc.get("id"), "content": result})
 
         if aborted:
-            out.info("\n[%d identical calls in a row detected, this turn stops here]" % MAX_REPEAT_CALLS)
+            out.info("\n[%s]" % abort_info)
             return
 
     out.info("\n[Tool call limit of %d reached for this turn, stopping]" % opts["max_steps"])
@@ -1693,6 +1777,7 @@ def setup_stdio():
 
 def main():
     setup_stdio()
+    install_sigint_handler()
 
     opts = parse_args()
     out = Output(opts["level"], opts["color"], opts["log_path"])
@@ -1744,11 +1829,20 @@ def main():
                 sys.stdout.write("Available commands:\n"
                                  "  /reset   clear the conversation history\n"
                                  "  /help    show this help\n"
-                                 "  exit     quit\n")
+                                 "  exit     quit\n"
+                                 "  Ctrl+C   first press interrupts the current turn (generation/command), "
+                                 "a second one quits\n")
                 continue
 
             try:
                 run_turn(user, messages, opts, out)
+            except KeyboardInterrupt:   # two Ctrl+C presses within one turn
+                sys.stdout.write("\nGoodbye.\n")
+                break
+            except TurnInterrupted:     # fallback: the interrupt landed outside generation/the tool loop
+                _close_dangling_tool_calls(
+                    messages, "Error: this turn was interrupted by Ctrl+C, this call was not executed.")
+                out.info("\n[this turn was interrupted; press Ctrl+C again to quit]")
             except RuntimeError as e:
                 out.log("ERROR", str(e))
                 out.error(str(e))
@@ -1756,6 +1850,11 @@ def main():
                 msg = "%s: %s" % (type(e).__name__, e)
                 out.log("ERROR", msg)
                 out.error(msg)
+            finally:
+                _INTERRUPT["busy"] = False
+    except KeyboardInterrupt:
+        # fallback: Ctrl+C pressed again while handling an error/interrupt, avoid a raw traceback
+        sys.stdout.write("\nGoodbye.\n")
     finally:
         out.log("SESSION END", "number: %d\nduration: %.1fs" % (out.session_id, time.time() - started))
         out.close()

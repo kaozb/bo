@@ -86,6 +86,36 @@ LEVEL_NAMES = ("quiet (仅最终答复)", "normal (工具调用一行提示)",
 
 
 # ---------------------------------------------------------------------------
+# Ctrl+C 语义：第一次中断当前一轮（生成或命令），第二次退出程序
+# ---------------------------------------------------------------------------
+
+class TurnInterrupted(BaseException):
+    """第一次 Ctrl+C 抛出：只结束当前这一轮，回到提示符，不退出程序。
+
+    继承 BaseException，避免被沿途的 except Exception 当成普通错误吞掉。
+    """
+
+
+# busy 表示「正处于一轮之内」，seen 表示本轮已经按过一次 Ctrl+C
+_INTERRUPT = {"busy": False, "seen": False}
+
+
+def _handle_sigint(signum, frame):
+    if _INTERRUPT["busy"] and not _INTERRUPT["seen"]:
+        _INTERRUPT["seen"] = True
+        raise TurnInterrupted()     # 一轮之内第一次按下：只中断本轮
+    raise KeyboardInterrupt()       # 空闲时、或本轮内第二次按下：退出程序
+
+
+def install_sigint_handler():
+    """接管 SIGINT；装不上（非主线程等）就沿用默认行为。"""
+    try:
+        signal.signal(signal.SIGINT, _handle_sigint)
+    except (ValueError, OSError):
+        pass
+
+
+# ---------------------------------------------------------------------------
 # 工具定义（OpenAI function calling 格式）
 # ---------------------------------------------------------------------------
 
@@ -241,12 +271,15 @@ def _is_error(result):
 
 
 def _confirm(prompt):
-    """向用户询问 yes/no；非 y/yes 一律视为拒绝（含 EOF 与 Ctrl-C）。"""
+    """向用户询问 yes/no；非 y/yes 一律视为拒绝（EOF/EOT 也算拒绝）。
+
+    Ctrl+C 不在这里吞掉：交给 _handle_sigint —— 本轮第一次只中断本轮，第二次退出程序。
+    """
     sys.stdout.write(prompt)
     sys.stdout.flush()
     try:
         ans = input().strip().lower()
-    except (EOFError, KeyboardInterrupt):
+    except EOFError:
         ans = "n"
     return ans in ("y", "yes")
 
@@ -318,7 +351,7 @@ def _atomic_write(path, data, mode=None):
             os.fsync(f.fileno())
         os.chmod(tmp, mode)
         os.replace(tmp, target)
-    except Exception:
+    except BaseException:  # 含 Ctrl+C（BaseException），中断也不能留下临时文件
         try:
             os.unlink(tmp)
         except Exception:
@@ -1052,6 +1085,12 @@ def tool_run_command(args, opts):
             return err
         if not os.path.isdir(cwd):
             return "错误: cwd 不是目录: %s" % args.get("cwd")
+    elif opts.get("root"):
+        # 默认 cwd（启动目录）同样要受 --root 约束，否则「只能访问 DIR 之内」形同虚设
+        cwd, err = _resolve(cwd, opts)
+        if err:
+            return ("错误: 默认工作目录 %s 越出允许范围（--root %s）。"
+                    "请先 cd 到该目录内再启动，或在参数里显式传 cwd。" % (opts["cwd"], opts["root"]))
 
     if opts["confirm"] and not _confirm("\n[待执行命令]%s %s\n确认执行? [y/N] " % (
             " (cwd=%s)" % cwd if cwd != opts["cwd"] else "", command)):
@@ -1078,6 +1117,9 @@ def tool_run_command(args, opts):
     timed_out = False
     try:
         proc.wait(timeout=timeout)
+    except (TurnInterrupted, KeyboardInterrupt):
+        _terminate_group(proc)      # Ctrl+C（中断本轮或退出）时都不留派生进程
+        raise
     except subprocess.TimeoutExpired:
         timed_out = True
         _terminate_group(proc)
@@ -1443,8 +1485,26 @@ def _trim_history(messages, keep_turns=TRIM_KEEP_TURNS):
     return dropped
 
 
+def _close_dangling_tool_calls(messages, note):
+    """给缺结果的那批 tool_calls 补一条结果，保持消息历史合法。
+
+    中断/异常可能落在工具循环之外，此时 assistant 的 tool_calls 已入历史却没人应答，
+    下一次请求会被接口判为格式错误；这里统一补齐。返回补了几条。
+    """
+    answered = set(m.get("tool_call_id") for m in messages if m.get("role") == "tool")
+    for m in reversed(messages):
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            pending = [tc for tc in m["tool_calls"] if tc.get("id") not in answered]
+            for tc in pending:
+                messages.append({"role": "tool", "tool_call_id": tc.get("id"), "content": note})
+            return len(pending)
+    return 0
+
+
 def run_turn(user_text, messages, opts, out):
     out.log("USER", user_text)
+    # 本轮内第一次 Ctrl+C 只中断本轮（见 _handle_sigint）；busy 由 main 在结束时复位
+    _INTERRUPT["busy"], _INTERRUPT["seen"] = True, False
     # 每轮开始前先瘦身：只保留最近 keep_turns 轮的工具往返，更早的调用与结果全部移除
     dropped = _trim_history(messages)
     if dropped:
@@ -1474,9 +1534,16 @@ def run_turn(user_text, messages, opts, out):
 
         try:
             msg = call_llm(messages, opts, on_delta)
+            interrupted = False
+        except TurnInterrupted:
+            interrupted = True
         finally:
             if cur_kind["v"] is not None:
                 out.stream_end()
+        if interrupted:
+            # 生成中途被打断：assistant 消息还没入历史，直接结束本轮即可
+            out.info("\n[已中断本次生成，本轮结束；再按一次 Ctrl+C 退出程序]")
+            return
 
         content = msg.get("content") or ""
         reasoning = msg.get("reasoning_content") or msg.get("reasoning") or ""
@@ -1491,7 +1558,8 @@ def run_turn(user_text, messages, opts, out):
         if content and out.level == LEVEL_QUIET and not tool_calls:
             out.assistant(content, True)
 
-        assistant_msg = {"role": "assistant", "content": msg.get("content")}
+        # content 统一成字符串：非流式回退时接口可能给出 null，部分服务端会判为格式错误
+        assistant_msg = {"role": "assistant", "content": msg.get("content") or ""}
         if tool_calls:
             assistant_msg["tool_calls"] = tool_calls
         messages.append(assistant_msg)
@@ -1499,13 +1567,14 @@ def run_turn(user_text, messages, opts, out):
             return
 
         aborted = False
+        abort_note = abort_info = ""
         for tc in tool_calls:
             fn = tc.get("function") or {}
             name, raw_args = fn.get("name"), fn.get("arguments") or "{}"
             out.log("TOOL_CALL " + (name or "?"), raw_args)
             out.tool_call(name, raw_args)
             if aborted:
-                result = "错误: 本轮已因重复调用中止，本次调用未执行。"
+                result = abort_note
                 messages.append({"role": "tool", "tool_call_id": tc.get("id"), "content": result})
                 continue
 
@@ -1516,6 +1585,8 @@ def run_turn(user_text, messages, opts, out):
                 repeat["key"], repeat["n"] = key, 1
             if repeat["n"] >= MAX_REPEAT_CALLS:
                 aborted = True
+                abort_note = "错误: 本轮已因重复调用中止，本次调用未执行。"
+                abort_info = "检测到连续 %d 次完全相同的调用，已停止本轮" % MAX_REPEAT_CALLS
                 result = ("错误: 完全相同的 %s 调用已连续出现 %d 次，已中止本轮，本次调用未执行。"
                           "请换一种思路，或直接说明结论。" % (name, repeat["n"]))
             else:
@@ -1526,14 +1597,22 @@ def run_turn(user_text, messages, opts, out):
                 except ValueError as e:
                     result = "错误: 无法解析工具参数 JSON: %s" % e
                 else:
-                    result = execute_tool(name, args, opts)
+                    try:
+                        result = execute_tool(name, args, opts)
+                    except TurnInterrupted:
+                        # 工具执行到一半被打断：结果不可信，也不继续跑后续调用
+                        result = ("错误: 用户按 Ctrl+C 中断了本轮，本次调用未正常结束，"
+                                  "请勿继续调用工具，等待用户下一步指示。")
+                        aborted = True
+                        abort_note = "错误: 本轮已被 Ctrl+C 中断，本次调用未执行。"
+                        abort_info = "已中断本轮（Ctrl+C），再按一次 Ctrl+C 退出程序"
 
             out.log("TOOL_RESULT " + (name or "?"), result)
             out.tool_result(result, _is_error(result))
             messages.append({"role": "tool", "tool_call_id": tc.get("id"), "content": result})
 
         if aborted:
-            out.info("\n[检测到连续 %d 次完全相同的调用，已停止本轮]" % MAX_REPEAT_CALLS)
+            out.info("\n[%s]" % abort_info)
             return
 
     out.info("\n[已达单轮工具调用上限 %d，停止本轮]" % opts["max_steps"])
@@ -1671,6 +1750,7 @@ def setup_stdio():
 
 def main():
     setup_stdio()
+    install_sigint_handler()
 
     opts = parse_args()
     out = Output(opts["level"], opts["color"], opts["log_path"])
@@ -1722,11 +1802,19 @@ def main():
                 sys.stdout.write("可用交互命令:\n"
                                  "  /reset   清空对话历史\n"
                                  "  /help    显示本帮助\n"
-                                 "  exit     退出\n")
+                                 "  exit     退出\n"
+                                 "  Ctrl+C   第一次只中断当前一轮（生成/命令），再按一次退出\n")
                 continue
 
             try:
                 run_turn(user, messages, opts, out)
+            except KeyboardInterrupt:   # 本轮内连按两次 Ctrl+C
+                sys.stdout.write("\n再见。\n")
+                break
+            except TurnInterrupted:     # 兜底：中断落在生成/工具循环之外
+                _close_dangling_tool_calls(
+                    messages, "错误: 本轮已被 Ctrl+C 中断，本次调用未执行。")
+                out.info("\n[已中断本轮；再按一次 Ctrl+C 退出程序]")
             except RuntimeError as e:
                 out.log("ERROR", str(e))
                 out.error(str(e))
@@ -1734,6 +1822,11 @@ def main():
                 msg = "%s: %s" % (type(e).__name__, e)
                 out.log("ERROR", msg)
                 out.error(msg)
+            finally:
+                _INTERRUPT["busy"] = False
+    except KeyboardInterrupt:
+        # 兜底：在错误/中断的收尾处理中再按一次 Ctrl+C，避免直接抛 traceback
+        sys.stdout.write("\n再见。\n")
     finally:
         out.log("SESSION END", "编号: %d\n耗时: %.1fs" % (out.session_id, time.time() - started))
         out.close()
