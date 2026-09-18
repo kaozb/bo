@@ -36,6 +36,7 @@ import argparse
 import base64
 import hashlib
 import hmac
+import io
 import json
 import os
 import platform
@@ -937,13 +938,33 @@ def parse_args():
     }
 
 
-def main():
-    if hasattr(sys.stdout, "reconfigure"):
+def setup_stdio():
+    """让标准输入输出使用 UTF-8，避免在 C/POSIX locale 下中文报 UnicodeEncodeError。
+
+    Python 3.7+ 有 reconfigure；3.6 没有，只能自己包一层 TextIOWrapper。
+    """
+    for name in ("stdout", "stderr", "stdin"):
+        stream = getattr(sys, name, None)
+        if stream is None:
+            continue
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+                continue
+            except Exception:
+                pass
+        buf = getattr(stream, "buffer", None)
+        if buf is None:
+            continue
         try:
-            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+            setattr(sys, name, io.TextIOWrapper(buf, encoding="utf-8", errors="replace"))
         except Exception:
             pass
+
+
+def main():
+    setup_stdio()
 
     opts = parse_args()
     out = Output(opts["level"], opts["color"], opts["log_path"])

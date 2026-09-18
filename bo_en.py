@@ -38,6 +38,7 @@ import argparse
 import base64
 import hashlib
 import hmac
+import io
 import json
 import os
 import platform
@@ -946,13 +947,33 @@ def parse_args():
     }
 
 
-def main():
-    if hasattr(sys.stdout, "reconfigure"):
+def setup_stdio():
+    """Force UTF-8 on stdin/stdout/stderr so non-ASCII output never fails.
+
+    Python 3.7+ has reconfigure; 3.6 does not, so wrap the raw buffer instead.
+    """
+    for name in ("stdout", "stderr", "stdin"):
+        stream = getattr(sys, name, None)
+        if stream is None:
+            continue
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+                continue
+            except Exception:
+                pass
+        buf = getattr(stream, "buffer", None)
+        if buf is None:
+            continue
         try:
-            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+            setattr(sys, name, io.TextIOWrapper(buf, encoding="utf-8", errors="replace"))
         except Exception:
             pass
+
+
+def main():
+    setup_stdio()
 
     opts = parse_args()
     out = Output(opts["level"], opts["color"], opts["log_path"])
