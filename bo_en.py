@@ -1486,6 +1486,18 @@ def db_load_session(conn, sid, system_prompt=None):
     for m in messages:
         if not m.get("tool_calls"):
             m.pop("tool_calls", None)
+    # Older versions did not validate arguments when persisting, so the database may hold a tool_call with illegal/truncated
+    # arguments (e.g. a truncated output of just "{"). Restoring such a call means HTTP 400 for every request —— strip it at
+    # load time so old sessions remain usable (compare: on the persisting side, _parse_tool_calls stops new broken records
+    # from being created).
+    bad_ids = set()
+    for m in messages:
+        for tc in m.get("tool_calls") or []:
+            fn = (tc.get("function") or {}) if isinstance(tc, dict) else {}
+            if not fn.get("name") or _tool_args_error(fn.get("arguments")):
+                bad_ids.add(tc.get("id"))
+    if bad_ids:
+        _drop_tool_calls_by_id(messages, bad_ids)
     if system_prompt is not None:
         messages.insert(0, {"role": "system", "content": system_prompt})
     return messages
@@ -1550,6 +1562,7 @@ class Output(object):
         "USER": ("user", 0, "user"),
         "ASSISTANT": ("assistant", None, "assistant"),
         "TRIM": ("trim", None, None),
+        "BAD_TOOL_CALL": ("bad_tool_call", None, None),
         "RESET": ("reset", 0, None),
         "ERROR": ("error", None, None),
         "SESSION END": ("session_end", 0, None),
@@ -1614,7 +1627,7 @@ class Output(object):
 
     def tool_call(self, name, raw_args):
         if self.level >= LEVEL_NORMAL:
-            self._w(self._c("  · %s(%s)\n" % (name, _brief(raw_args)), self.DIM))
+            self._w(self._c("  · %s(%s)" % (name or "?", _brief(raw_args or "{}")), self.DIM) + "\n")
 
     def tool_result(self, result, is_error):
         if self.level >= LEVEL_VERBOSE:
@@ -1714,6 +1727,79 @@ def _trim_history(messages, keep_calls=TRIM_KEEP_CALLS):
     dropped = len(messages) - len(merged)
     messages[:] = merged
     return dropped
+
+
+def _tool_args_error(raw):
+    """Check one tool_call's arguments; return None if usable, otherwise a description of the error.
+
+    The API does not validate the content of arguments, and the model occasionally emits a truncated `{`, or a whole XML blob
+    (mistaking the tool-call examples in the prompt for its own output). Such a call cannot be executed locally, and once it is
+    stored in the database / put into the history, every subsequent request is judged HTTP 400 input_invalid by the API —— so it
+    must be rejected before anything is persisted.
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return "arguments empty"
+    try:
+        obj = json.loads(raw)
+    except ValueError as e:
+        return str(e)
+    if not isinstance(obj, dict):
+        return "arguments is not a JSON object"
+    return None
+
+
+def _parse_tool_calls(tool_calls):
+    """Split the tool_calls returned by the model into (usable, unusable).
+
+    Usable is a list of (call, parsed arguments), unusable is a list of calls. A missing tool name/arguments also counts as
+    unusable —— such a call likewise cannot be restored into legal tool_calls from the database, so it belongs to the same class
+    of "storing it will cause a 400" calls.
+    """
+    ok, bad = [], []
+    for tc in tool_calls or []:
+        fn = tc.get("function") if isinstance(tc, dict) else None
+        name = fn.get("name") if isinstance(fn, dict) else None
+        raw = fn.get("arguments") if isinstance(fn, dict) else None
+        if not name:
+            bad.append(tc)
+            continue
+        why = _tool_args_error(raw)
+        if why:
+            bad.append(tc)
+            continue
+        ok.append((tc, json.loads(raw)))
+    return ok, bad
+
+
+def _drop_tool_calls_by_id(messages, ids):
+    """Strip the tool_calls with the given ids (and their results) in place.
+
+    Fallback: guarantees that neither the tool_calls sent to the API nor those written to the database contain illegal arguments.
+    Normally _parse_tool_calls already rejects broken calls before persisting; this is used to clean up old records left in the history.
+    The granularity is a single call: if an assistant message still has other calls, only the broken ones are deleted, and the whole
+    message is removed only when all that remains is broken calls (and there is no content); the accompanying role=tool results are
+    cleared as well, to avoid leaving orphan results with no corresponding call.
+    """
+    want = set(i for i in ids if i)
+    if not want:
+        return
+    out = []
+    for m in messages:
+        role = m.get("role")
+        if role == "tool" and m.get("tool_call_id") in want:
+            continue                              # the result of the broken call is removed as well
+        if role == "assistant" and m.get("tool_calls"):
+            keep = [tc for tc in m["tool_calls"] if tc.get("id") not in want]
+            if len(keep) != len(m["tool_calls"]):
+                # must be modified in place (not replaced by a dict copy): the caller may still hold a reference to this message
+                if keep:
+                    m["tool_calls"] = keep
+                elif (m.get("content") or "").strip():
+                    m.pop("tool_calls", None)     # has content, only the tool_calls is stripped
+                else:
+                    continue                      # broken calls only and no content, drop the whole message
+        out.append(m)
+    messages[:] = out
 
 
 def _close_dangling_tool_calls(messages, note):
@@ -1838,11 +1924,40 @@ def run_turn(user_text, messages, opts, out):
         if not tool_calls:
             return
 
+        # Parse the arguments and discard calls that fail to parse before persisting or going into the history —— this guarantees
+        # that neither the database nor messages ever hold tool_calls with illegal arguments (the direct source of API HTTP 400)
+        parsed, bad = _parse_tool_calls(tool_calls)
+        if bad:
+            # A broken call cannot be executed locally: strip it from the assistant message (not persisted, not put into history), keeping only the usable ones
+            bad_ids = set(tc.get("id") for tc in bad)
+            keep = [tc for tc in assistant_msg["tool_calls"]
+                    if tc.get("id") not in bad_ids]
+            if keep:
+                assistant_msg["tool_calls"] = keep
+            else:
+                del assistant_msg["tool_calls"]
+                if not (assistant_msg.get("content") or "").strip():
+                    messages.pop()          # no content and no calls kept, the whole message is unnecessary
+            for tc in bad:
+                fn = tc.get("function") or {}
+                reason = _tool_args_error(fn.get("arguments"))
+                out.tool_call(fn.get("name"), fn.get("arguments"))
+                out.tool_result("Error: cannot parse the tool argument JSON: %s" % reason, True)
+                out.log("BAD_TOOL_CALL",
+                        "%s arguments are not valid JSON, the call was discarded (not persisted, not put into history): %s"
+                        % (fn.get("name") or "?", _brief(fn.get("arguments"), 200)),
+                        tool_call_id=tc.get("id"))
+            out.info("  ! %d tool call(s) had unparseable arguments and were discarded (the conversation continues)" % len(bad))
+        if not parsed:
+            # the whole batch of calls is unusable: end the turn here (the history holds no broken calls, so the next request is definitely legal)
+            return
+
         aborted = False
         abort_note = abort_info = ""
-        for tc in tool_calls:
-            fn = tc.get("function") or {}
-            name, raw_args = fn.get("name"), fn.get("arguments") or "{}"
+        for tc, args in parsed:
+            name = (tc.get("function") or {}).get("name")
+            raw_args = (tc.get("function") or {}).get("arguments")
+            # arguments are confirmed legal, only now persist/put into history: whatever is stored can always be replayed
             out.log("TOOL_CALL " + (name or "?"), raw_args, tool_call_id=tc.get("id"))
             out.tool_call(name, raw_args)
             if aborted:
@@ -1863,21 +1978,14 @@ def run_turn(user_text, messages, opts, out):
                           "Please try a different approach, or state your conclusion directly." % (name, repeat["n"]))
             else:
                 try:
-                    args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-                    if not isinstance(args, dict):
-                        args = {}
-                except ValueError as e:
-                    result = "Error: cannot parse the tool argument JSON: %s" % e
-                else:
-                    try:
-                        result = execute_tool(name, args, opts)
-                    except TurnInterrupted:
-                        # interrupted halfway through tool execution: the result is untrustworthy, and later calls are not run either
-                        result = ("Error: the user interrupted this turn with Ctrl+C, this call did not finish properly;"
-                                  " do not keep calling tools, wait for the user's next instruction.")
-                        aborted = True
-                        abort_note = "Error: this turn was interrupted by Ctrl+C, this call did not execute."
-                        abort_info = "this turn was interrupted (Ctrl+C); press Ctrl+C again to quit the program"
+                    result = execute_tool(name, args, opts)
+                except TurnInterrupted:
+                    # interrupted halfway through tool execution: the result is untrustworthy, and later calls are not run either
+                    result = ("Error: the user interrupted this turn with Ctrl+C, this call did not finish properly;"
+                              " do not keep calling tools, wait for the user's next instruction.")
+                    aborted = True
+                    abort_note = "Error: this turn was interrupted by Ctrl+C, this call did not execute."
+                    abort_info = "this turn was interrupted (Ctrl+C); press Ctrl+C again to quit the program"
 
             out.log("TOOL_RESULT " + (name or "?"), result, tool_call_id=tc.get("id"))
             out.tool_result(result, _is_error(result))

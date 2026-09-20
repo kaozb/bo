@@ -1486,6 +1486,17 @@ def db_load_session(conn, sid, system_prompt=None):
     for m in messages:
         if not m.get("tool_calls"):
             m.pop("tool_calls", None)
+    # 旧版落盘时未校验参数，库里可能存着 arguments 非法/残缺的 tool_call（例如仅 "{"
+    # 的截断输出）。这类调用还原出来就是每次请求都 HTTP 400——载入时直接摘掉，
+    # 让老会话也能继续用（比对：落盘侧的 _parse_tool_calls 负责不再产生新的坏记录）。
+    bad_ids = set()
+    for m in messages:
+        for tc in m.get("tool_calls") or []:
+            fn = (tc.get("function") or {}) if isinstance(tc, dict) else {}
+            if not fn.get("name") or _tool_args_error(fn.get("arguments")):
+                bad_ids.add(tc.get("id"))
+    if bad_ids:
+        _drop_tool_calls_by_id(messages, bad_ids)
     if system_prompt is not None:
         messages.insert(0, {"role": "system", "content": system_prompt})
     return messages
@@ -1550,6 +1561,7 @@ class Output(object):
         "USER": ("user", 0, "user"),
         "ASSISTANT": ("assistant", None, "assistant"),
         "TRIM": ("trim", None, None),
+        "BAD_TOOL_CALL": ("bad_tool_call", None, None),
         "RESET": ("reset", 0, None),
         "ERROR": ("error", None, None),
         "SESSION END": ("session_end", 0, None),
@@ -1614,7 +1626,7 @@ class Output(object):
 
     def tool_call(self, name, raw_args):
         if self.level >= LEVEL_NORMAL:
-            self._w(self._c("  · %s(%s)\n" % (name, _brief(raw_args)), self.DIM))
+            self._w(self._c("  · %s(%s)" % (name or "?", _brief(raw_args or "{}")), self.DIM) + "\n")
 
     def tool_result(self, result, is_error):
         if self.level >= LEVEL_VERBOSE:
@@ -1714,6 +1726,77 @@ def _trim_history(messages, keep_calls=TRIM_KEEP_CALLS):
     dropped = len(messages) - len(merged)
     messages[:] = merged
     return dropped
+
+
+def _tool_args_error(raw):
+    """检查一个 tool_call 的 arguments；返回 None 表示可用，否则返回错误说明。
+
+    服务端不校验 arguments 的内容，模型偶尔会吐出截断的 `{`、或整段 XML（把提示里的
+    工具调用样例当成输出了）。这种调用本地执行不了，且一旦入库/入历史，之后每次请求
+    都会被接口判 HTTP 400 input_invalid——所以在落盘前就必须拦掉。
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return "参数为空"
+    try:
+        obj = json.loads(raw)
+    except ValueError as e:
+        return str(e)
+    if not isinstance(obj, dict):
+        return "参数不是 JSON 对象"
+    return None
+
+
+def _parse_tool_calls(tool_calls):
+    """把模型返回的 tool_calls 分成 (可用的, 不可用的)。
+
+    可用的为 (调用, 已解析的参数) 列表，不可用的为调用列表。工具名/参数缺失同样算不可用
+    ——它们在库里也还原不出合法的 tool_calls，属于同一类「存了就会 400」的调用。
+    """
+    ok, bad = [], []
+    for tc in tool_calls or []:
+        fn = tc.get("function") if isinstance(tc, dict) else None
+        name = fn.get("name") if isinstance(fn, dict) else None
+        raw = fn.get("arguments") if isinstance(fn, dict) else None
+        if not name:
+            bad.append(tc)
+            continue
+        why = _tool_args_error(raw)
+        if why:
+            bad.append(tc)
+            continue
+        ok.append((tc, json.loads(raw)))
+    return ok, bad
+
+
+def _drop_tool_calls_by_id(messages, ids):
+    """就地摘掉指定 id 的 tool_calls（及其结果）。
+
+    兜底：保证送到接口与写进库里的 tool_calls 都不含非法参数。正常情况下
+    _parse_tool_calls 已在落盘前拦掉坏调用，这里用于清理历史里残留的旧记录。
+    清理粒度到单个调用：一条 assistant 消息里若还有其它调用则只删除坏的，
+    仅当整条只剩坏调用（且没有正文）时才整条移除；配套的 role=tool 结果一并清掉，
+    避免留下没有对应调用的孤儿结果。
+    """
+    want = set(i for i in ids if i)
+    if not want:
+        return
+    out = []
+    for m in messages:
+        role = m.get("role")
+        if role == "tool" and m.get("tool_call_id") in want:
+            continue                              # 坏调用的结果一并移除
+        if role == "assistant" and m.get("tool_calls"):
+            keep = [tc for tc in m["tool_calls"] if tc.get("id") not in want]
+            if len(keep) != len(m["tool_calls"]):
+                # 必须就地改（不能换成 dict 副本）：调用方可能仍持有同一条消息的引用
+                if keep:
+                    m["tool_calls"] = keep
+                elif (m.get("content") or "").strip():
+                    m.pop("tool_calls", None)     # 有正文，只摘掉 tool_calls
+                else:
+                    continue                      # 纯坏调用、没正文，整条移除
+        out.append(m)
+    messages[:] = out
 
 
 def _close_dangling_tool_calls(messages, note):
@@ -1838,11 +1921,40 @@ def run_turn(user_text, messages, opts, out):
         if not tool_calls:
             return
 
+        # 先解析参数、丢弃解析失败的调用，再做落盘与入历史——保证库里和 messages 里
+        # 都不会出现 arguments 非法或残缺的 tool_calls（那是接口 HTTP 400 的直接来源）
+        parsed, bad = _parse_tool_calls(tool_calls)
+        if bad:
+            # 坏调用连本地都执行不了：摘出助手消息（不入库、不入历史），只保留能用的
+            bad_ids = set(tc.get("id") for tc in bad)
+            keep = [tc for tc in assistant_msg["tool_calls"]
+                    if tc.get("id") not in bad_ids]
+            if keep:
+                assistant_msg["tool_calls"] = keep
+            else:
+                del assistant_msg["tool_calls"]
+                if not (assistant_msg.get("content") or "").strip():
+                    messages.pop()          # 没有正文也没保留调用，整条不必留
+            for tc in bad:
+                fn = tc.get("function") or {}
+                reason = _tool_args_error(fn.get("arguments"))
+                out.tool_call(fn.get("name"), fn.get("arguments"))
+                out.tool_result("错误: 无法解析工具参数 JSON: %s" % reason, True)
+                out.log("BAD_TOOL_CALL",
+                        "%s 的参数不是合法 JSON，已丢弃该调用（不入库、不入历史）: %s"
+                        % (fn.get("name") or "?", _brief(fn.get("arguments"), 200)),
+                        tool_call_id=tc.get("id"))
+            out.info("  ! 有 %d 个工具调用参数无法解析，已丢弃（不影响后续对话）" % len(bad))
+        if not parsed:
+            # 整批调用都不可用：本轮到此为止（历史里没有任何坏调用，下次请求必然合法）
+            return
+
         aborted = False
         abort_note = abort_info = ""
-        for tc in tool_calls:
-            fn = tc.get("function") or {}
-            name, raw_args = fn.get("name"), fn.get("arguments") or "{}"
+        for tc, args in parsed:
+            name = (tc.get("function") or {}).get("name")
+            raw_args = (tc.get("function") or {}).get("arguments")
+            # 参数已确认合法，此刻才落盘/入历史：库里存的必然是可重放的调用
             out.log("TOOL_CALL " + (name or "?"), raw_args, tool_call_id=tc.get("id"))
             out.tool_call(name, raw_args)
             if aborted:
@@ -1863,21 +1975,14 @@ def run_turn(user_text, messages, opts, out):
                           "请换一种思路，或直接说明结论。" % (name, repeat["n"]))
             else:
                 try:
-                    args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-                    if not isinstance(args, dict):
-                        args = {}
-                except ValueError as e:
-                    result = "错误: 无法解析工具参数 JSON: %s" % e
-                else:
-                    try:
-                        result = execute_tool(name, args, opts)
-                    except TurnInterrupted:
-                        # 工具执行到一半被打断：结果不可信，也不继续跑后续调用
-                        result = ("错误: 用户按 Ctrl+C 中断了本轮，本次调用未正常结束，"
-                                  "请勿继续调用工具，等待用户下一步指示。")
-                        aborted = True
-                        abort_note = "错误: 本轮已被 Ctrl+C 中断，本次调用未执行。"
-                        abort_info = "已中断本轮（Ctrl+C），再按一次 Ctrl+C 退出程序"
+                    result = execute_tool(name, args, opts)
+                except TurnInterrupted:
+                    # 工具执行到一半被打断：结果不可信，也不继续跑后续调用
+                    result = ("错误: 用户按 Ctrl+C 中断了本轮，本次调用未正常结束，"
+                              "请勿继续调用工具，等待用户下一步指示。")
+                    aborted = True
+                    abort_note = "错误: 本轮已被 Ctrl+C 中断，本次调用未执行。"
+                    abort_info = "已中断本轮（Ctrl+C），再按一次 Ctrl+C 退出程序"
 
             out.log("TOOL_RESULT " + (name or "?"), result, tool_call_id=tc.get("id"))
             out.tool_result(result, _is_error(result))
