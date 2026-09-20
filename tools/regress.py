@@ -84,9 +84,7 @@ def test_read_file(d):
         for i in range(400000):
             f.write("line %07d abcdefghijklmnop\n" % i)
     out = bo.tool_read_file({"path": big, "offset": 399998, "limit": 5}, OPTS)
-    check("大文件(>10MB)窗口读取", "共 400000 行" in out and "line 0399999" in out, out[:100])
-    out = bo.tool_read_file({"path": big, "offset": 1, "limit": 3}, OPTS)
-    check("大文件首行", "line 0000000" in out, out[:100])
+    check("大文件(>3MB)拒绝读取", "文件过大" in out and "上限 3 MB" in out, out[:100])
 
 
 # --------------------------------------------------------------------------

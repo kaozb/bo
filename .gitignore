@@ -23,6 +23,8 @@ htmlcov/
 # BO runtime output
 BO.log
 *.log
+.ai.db
+.ai.db-*
 
 # Secrets & local overrides
 .env

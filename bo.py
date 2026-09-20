@@ -17,21 +17,18 @@
     -b, --base-url URL  接口地址（覆盖 OPENAI_BASE_URL）
     -k, --api-key KEY   API 密钥（覆盖 OPENAI_API_KEY）
     -y, --yes           命令执行前逐条人工确认（不加则默认直接放行）
-    -r, --root DIR      限制文件类工具（read_file/write_file/search）与 run_command 的
-                        cwd 只能访问 DIR 之内（默认不限制）
     -s, --max-steps N   单轮最多工具调用轮数（默认 50）
     -t, --http-timeout N  单次请求超时秒数（默认 120）
     -q                  只显示最终答复，隐藏全部工具/思考过程
     -v / -vv            显示工具结果与思考 / 完整明细
     -C, --no-color      关闭彩色输出
-    -l, --log [FILE]    完整交互写入日志（默认 BO.log），屏幕上不显示明细
-    -L, --no-log        撤销已记录的 -l/--log，停止写日志
+    -d, --db FILE       会话数据库（默认 .ai.db），完整交互记录写入此处
 
-参数记忆: 显式传入的连接类参数（-m / -b / -k / -r / -s / -t / -l）会加密记录到当前目录的 .bo，
+参数记忆: 显式传入的连接类参数（-m / -b / -k / -s / -t / -d）会加密记录到用户主目录的 .bo，
           之后不传参或只传部分参数时自动复用；-y / -q / -v / -C 等交互与显示开关仅本次生效，
           不写入该文件。优先级: 命令行 > 环境变量 > .bo > 内置默认；删除 .bo 即恢复默认。
 
-交互: /reset 清空对话，/help 帮助，exit 退出
+交互: /reset 清空并开新会话，/s 载入历史会话，/help 帮助，exit 退出
 """
 
 import argparse
@@ -41,12 +38,12 @@ import fnmatch
 import hashlib
 import hmac
 import io
-import itertools
 import json
 import os
 import platform
 import re
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -62,7 +59,8 @@ except Exception:
 
 MAX_OUTPUT_CHARS = 30000             # 单个工具结果进入上下文的最大字符数
 MAX_LINE_CHARS = 2000                # read_file 单行最大显示字符数
-MAX_READ_BYTES = 10 * 1024 * 1024    # 文件读写大小上限，防止内存被撑爆
+MAX_READ_BYTES = 3 * 1024 * 1024     # 文件读写大小上限，超过一律拒绝（防止内存被撑爆）
+MAX_READ_MB = MAX_READ_BYTES // 1048576  # 上限的 MB 数值，供提示文案复用
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024  # 单次 HTTP 响应大小上限
 MAX_SEARCH_FILE_BYTES = 2 * 1024 * 1024  # search 单文件最大读取字节数
 MAX_SEARCH_RESULTS = 1000            # search 单次最多返回的结果行数
@@ -71,13 +69,16 @@ MAX_COMMAND_TIMEOUT = 3600           # run_command 超时上限（秒）
 MAX_COMMAND_OUTPUT_BYTES = 256 * 1024  # run_command 在内存保留的输出上限（首尾各半，再截到可见长度）
 MAX_DIR_ITEMS = 1000                 # read_file 列目录时单次最多显示的项目数
 MAX_REPEAT_CALLS = 3                 # 同一轮内完全相同的工具调用连续出现该次数即中止本轮
-TRIM_KEEP_TURNS = 1                  # 每轮开始时保留最近几轮的完整工具调用/结果（更早的移除）
+TRIM_KEEP_CALLS = 1                  # 历史里只保留最近几次工具调用（含其结果），更早的移除
 SEARCH_SKIP_DIRS = (".git", "__pycache__", "node_modules", ".venv", "venv",
                     ".tox", ".mypy_cache", ".pytest_cache")  # search 跳过的目录
 AGENT_FILE = "AGENTS.md"             # 当前目录下的约定文件（不区分大小写），存在则提示模型自行读取
-CONFIG_FILE = ".bo"                  # 当前目录下的参数记忆文件（加密），显式传参时写入、无参时复用
+CONFIG_FILE = os.path.join(os.path.expanduser("~"), ".bo")
+# 用户主目录下的参数记忆文件（加密），全局共用：显式传参时写入、无参时复用
 # 只有这些「连接/运行类」参数会写入 .bo；交互与显示开关（-y / -q / -v / -C）仅本次生效
-CONFIG_KEYS = ("model", "base_url", "api_key", "root", "max_steps", "http_timeout", "log_path")
+CONFIG_KEYS = ("model", "base_url", "api_key", "max_steps", "http_timeout", "db_path")
+DEFAULT_DB_FILE = ".ai.db"              # 默认会话数据库文件名（位于启动目录），可用 -d/--db 指定并记忆
+BO_VERSION = "1.1.0-db"                 # 写入会话库的版本标识
 
 # 屏幕展示分级
 LEVEL_QUIET, LEVEL_NORMAL, LEVEL_VERBOSE, LEVEL_DEBUG = 0, 1, 2, 3
@@ -144,10 +145,13 @@ TOOLS = [
          "offset": _p("integer", "起始行号 / 起始项目，从 1 开始，默认 1"),
          "limit": _p("integer", "文件最多读取行数（默认 2000）/ 目录最多列出项数（默认 200）")},
         ["path"]),
-    _fn("write_file", "写文件：给 content 新建或整体覆盖（新建文件必须用它，不要用 run_command 的 echo/cat "
-        "重定向）；给 old_string + new_string 或 edits 对已有文件做精确替换（只改局部请用这种模式），"
-        "两种模式不能混用。old_string 必须唯一出现，否则报错并列出候选位置；多处不同修改用 edits 一次提交；"
-        "父目录不存在会自动创建；content 为空会被拒绝。",
+    _fn("write_file", "写文件，两种模式【严禁混用】：\n"
+        "① 新建/整体覆盖：只给 path + content（不要给 old_string/new_string/edits）。\n"
+        "② 只改局部：只给 path + old_string + new_string（或 edits 一次提交多处），"
+        "此时【不要给 content】。\n"
+        "反例（会失败）：同时给 content 和 old_string。正确做法：改局部就只给 old_string+new_string。\n"
+        "old_string 必须原样出现在文件中且唯一（行尾空格/缩进都要一致，不要带行号），"
+        "否则报错并列出候选行；多处不同修改用 edits 一次提交；父目录不存在会自动创建；content 为空会被拒绝。",
         {"path": _p("string", "文件路径"),
          "content": _p("string", "整体写入的完整文本内容（与 old_string/edits 二选一，不能为空）"),
          "old_string": _p("string", "被替换的原文，需在文件中唯一（与 content 二选一；不要带行号）"),
@@ -170,7 +174,7 @@ TOOLS = [
     _fn("run_command", "在 shell 中执行命令，返回退出码与合并后的 stdout+stderr。"
         "命令的 stdin 是空的，不要执行 vim / top 等交互式命令；输出过大时只保留首尾并提示截断。",
         {"command": _p("string", "要执行的 shell 命令（非交互式；后台任务请自行 nohup ... &）"),
-         "cwd": _p("string", "命令的工作目录，默认当前目录（须在 --root 允许范围内）"),
+         "cwd": _p("string", "命令的工作目录，默认当前目录"),
          "timeout": _p("integer", "超时秒数，默认 120，超时后连同派生进程一起终止")},
         ["command"]),
 ]
@@ -190,20 +194,11 @@ def _decode_bytes(data):
     return data.decode("utf-8", "replace"), "utf-8"
 
 
-def _detect_encoding(data):
-    """返回能无损解码 data 的候选编码；判定与 _decode_bytes 完全相同。"""
-    return _decode_bytes(data)[1]
-
-
 def _count_lines(data):
     """统计行数（\\n 断行，末行无换行符也算一行）；data 可为 bytes 或 str。"""
     nl = b"\n" if isinstance(data, bytes) else "\n"
     n = data.count(nl)
     return n + 1 if data and not data.endswith(nl) else n
-
-
-def _decode(data):
-    return _decode_bytes(data)[0]
 
 
 def _split_lines(text):
@@ -295,18 +290,14 @@ def _truncate_middle(text, limit=MAX_OUTPUT_CHARS):
 
 
 # ---------------------------------------------------------------------------
-# 文件访问（含路径限制与原子写入）
+# 文件访问（路径规范化、大小上限与原子写入）
 # ---------------------------------------------------------------------------
 
 def _resolve(path, opts):
-    """校验路径，返回 (真实路径, 错误信息)。受 --root 限制时越界即报错。"""
+    """把路径规范化为真实路径，返回 (真实路径, 错误信息)。opts 保留以统一调用签名。"""
     if not path:
         return None, "错误: 缺少 path 参数"
-    real = os.path.realpath(path)
-    root = opts.get("root")
-    if root and real != root and not real.startswith(root + os.sep):
-        return None, "错误: 路径越出允许范围（--root %s）: %s" % (root, path)
-    return real, None
+    return os.path.realpath(path), None
 
 
 def _read_file_bytes(path):
@@ -318,7 +309,7 @@ def _read_file_bytes(path):
     size = os.path.getsize(path)
     if size > MAX_READ_BYTES:
         return None, "错误: 文件过大（%.1f MB，上限 %d MB），请用 run_command 配合 head/tail/sed 处理" % (
-            size / 1048576.0, MAX_READ_BYTES // 1048576)
+            size / 1048576.0, MAX_READ_MB)
     try:
         with open(path, "rb") as f:
             return f.read(), None
@@ -362,46 +353,17 @@ def _atomic_write(path, data, mode=None):
 def _read_lines_window(path, shown, offset, limit):
     """按行窗口读取文件，返回 (行列表, 总行数, 错误)；offset 为 0 基。
 
-    小文件一次读入并用 _decode_bytes 探测编码（GBK 等也能正确读出）；
-    超过 MAX_READ_BYTES 的大文件改为两遍流式扫描：先分块统计 \n 得到总行数，
-    再用 TextIOWrapper 只取目标行，因此不会把整份内容读进内存。
+    整份读入后用 _decode_bytes 探测编码（utf-8 → gbk → latin-1，GBK 等也能正确读出）。
+    超过 MAX_READ_BYTES 的文件由 _read_file_bytes 直接拒绝，不再走流式扫描，
+    因此不存在「小文件正常、大文件因硬编码 utf-8 而乱码」的双路径不一致。
     """
-    if os.path.getsize(path) <= MAX_READ_BYTES:
-        raw, err = _read_file_bytes(path)
-        if err:
-            return None, 0, err
-        if b"\x00" in raw[:8192]:
-            return None, 0, _binary_error(shown)
-        lines = _split_lines(_decode_bytes(raw)[0])
-        return lines[offset:offset + limit], len(lines), None
-
-    total, last = 0, b""
-    try:
-        with open(path, "rb") as f:
-            if b"\x00" in f.read(8192):  # 二进制嗅探与统计行数共用这一次 open
-                return None, 0, _binary_error(shown)
-            f.seek(0)
-            while True:
-                chunk = f.read(1 << 20)
-                if not chunk:
-                    break
-                total += chunk.count(b"\n")
-                last = chunk[-1:]
-    except Exception as e:
-        return None, 0, "错误: 读取失败: %s" % e
-    if last and last != b"\n":
-        total += 1  # 末行没有换行符
-
-    out = []
-    if offset < total:
-        try:
-            with open(path, "rb") as f:
-                wrap = io.TextIOWrapper(f, encoding="utf-8", errors="replace", newline="")
-                for ln in itertools.islice(wrap, offset, offset + limit):
-                    out.append(ln.rstrip("\n").rstrip("\r"))
-        except Exception as e:
-            return None, 0, "错误: 读取失败: %s" % e
-    return out, total, None
+    raw, err = _read_file_bytes(path)
+    if err:
+        return None, 0, err
+    if b"\x00" in raw[:8192]:
+        return None, 0, _binary_error(shown)
+    lines = _split_lines(_decode_bytes(raw)[0])
+    return lines[offset:offset + limit], len(lines), None
 
 
 def _list_dir(real, shown, offset=0, limit=200):
@@ -596,31 +558,46 @@ def tool_read_file(args, opts):
     return header + "\n" + "\n".join(shown_lines) + footer
 
 
+def _pick_write_mode(args):
+    """按参数判断写入模式，返回 (执行函数, 附加提示)；参数组合非法时函数为 None、提示即错误信息。"""
+    has_content = args.get("content") is not None
+    has_edit = (args.get("edits") is not None or args.get("old_string") is not None
+                or args.get("new_string") is not None)
+    if has_content and has_edit:
+        # 模型手滑：把整段上下文塞进 content，又给了 old_string/new_string。
+        # 只要出现了 new_string / edits，意图就是局部替换，忽略 content 直接执行。
+        if args.get("new_string") is not None or args.get("edits") is not None:
+            return _edit_existing_file, ("\n提示: 检测到同时给了 content，已按「局部替换」处理"
+                                          "并忽略 content。若确实要整体覆盖，请只传 content。")
+        return None, ("错误: content 与 old_string/new_string/edits 不能同时使用。"
+                      "整体写入请只给 content；局部替换请只给 old_string + new_string 或 edits。"
+                      "（若想局部替换，请补上 new_string。）")
+    if has_edit:
+        return _edit_existing_file, ""
+    if not has_content:
+        hint = ""
+        if args.get("replace_all") is not None:
+            hint = "（replace_all 只在配合 old_string/new_string/edits 时有效，本次未生效）"
+        return None, ("错误: 缺少参数。整体写入需 content；局部替换需 old_string + new_string，"
+                      "或用 edits 一次提交多处修改。" + hint)
+    if args.get("replace_all") is not None:
+        return _write_whole_file, ("\n提示: replace_all 只在局部替换（old_string/new_string 或 edits）"
+                                    "时有效，本次整体写入已忽略该参数。")
+    return _write_whole_file, ""
+
+
 def tool_write_file(args, opts):
     """写文件：按参数自动选择「整体写入」或「精确替换」两种模式。"""
     shown = args.get("path")
     path, err = _resolve(shown, opts)
     if err:
         return err
-
-    has_content = args.get("content") is not None
-    has_edit = (args.get("edits") is not None or args.get("old_string") is not None
-                or args.get("new_string") is not None)
-    if has_content and has_edit:
-        return ("错误: content 与 old_string/new_string/edits 不能同时使用。"
-                "整体写入请只给 content；局部替换请只给 old_string + new_string 或 edits。")
-    if has_edit:
-        return _edit_existing_file(path, shown, args)
-    if not has_content:
-        hint = ""
-        if args.get("replace_all") is not None:
-            hint = "（replace_all 只在配合 old_string/new_string/edits 时有效，本次未生效）"
-        return ("错误: 缺少参数。整体写入需 content；局部替换需 old_string + new_string，"
-                "或用 edits 一次提交多处修改。" + hint)
-    result = _write_whole_file(path, shown, args)
-    if args.get("replace_all") is not None and result.startswith("已"):
-        result += ("\n提示: replace_all 只在局部替换（old_string/new_string 或 edits）时有效，"
-                   "本次整体写入已忽略该参数。")
+    func, hint = _pick_write_mode(args)
+    if func is None:
+        return hint  # 参数组合非法，提示即错误信息
+    result = func(path, shown, args)
+    if hint and result.startswith("已"):  # 只有成功才附加提示
+        result += hint
     return result
 
 
@@ -646,7 +623,7 @@ def _write_whole_file(path, shown, args):
             return err
         old_bytes = len(raw)
         old_lines = _count_lines(raw)
-        enc = _detect_encoding(raw)
+        enc = _decode_bytes(raw)[1]
     enc_note = ""
     try:
         data = content.encode(enc)
@@ -677,11 +654,6 @@ def _write_whole_file(path, shown, args):
         result += "\n注意: 新内容比原文件小了 %.0f%%，若只想改局部请改用 old_string/new_string。" % (
             (1 - new_bytes / float(old_bytes)) * 100)
     return result
-
-
-def _line_of(text, idx):
-    """下标 -> 1 基行号。"""
-    return text.count("\n", 0, idx) + 1
 
 
 def _line_text(text, idx):
@@ -753,9 +725,39 @@ def _locate(text, old):
     return spans, "，已忽略行尾空白/CRLF 差异" if spans else ""
 
 
+def _locate_tolerant(text, old):
+    """兜底降级：old_string 与文件某行的差异仅在「空白的多少/位置/tab/CRLF」时，
+    用「删除所有空白后整行相等」来定位，返回该行的原文跨度 (跨度列表, 说明)。
+
+    典型手滑：`foo; }` 写成 `foo;}`、行尾多/少空格、缩进对不齐等。
+    只处理单行 old（多行 old 交给 _locate_fuzzy）；归一化后过短则放弃，避免误匹配。
+    """
+    o_lines = [ln for ln in old.split("\n") if ln.strip()]
+    if len(o_lines) != 1:
+        return [], ""
+    key = re.sub(r"\s+", "", o_lines[0])
+    if len(key) < 4:  # 归一化后太短（如 "}"、"fi"）容易误伤，放弃兜底
+        return [], ""
+    spans, acc = [], 0
+    for ln in text.split("\n"):
+        if re.sub(r"\s+", "", ln) == key:
+            spans.append((acc, acc + len(ln)))
+        acc += len(ln) + 1
+    return spans, ("，已按整行匹配（忽略了空白差异）" if spans else "")
+
+
 def _probe_fragments(old, limit=3):
-    """从 old 中取出用于近似定位的片段：优先整行，其次较长的词。"""
+    """从 old 中取出用于近似定位的片段：优先整行，其次较长的词。
+
+    无论首个非空行多短都纳入探测（哪怕只有 "}"、"fi"），否则 old_string 只是
+    漏了个空格/分号时，唯一能定位的行会因为太短被整段过滤掉，导致提示
+    「未找到相近内容」。
+    """
     frags = [s for s in (ln.strip() for ln in old.split("\n")) if len(s) >= 3]
+    for s in (ln.strip() for ln in old.split("\n")):
+        if s and s not in frags:  # 保底：把首个非空行也纳入，兼顾极短行
+            frags.insert(0, s)
+            break
     if not frags:
         frags = [t for t in re.split(r"[^0-9A-Za-z_]+", old) if len(t) >= 3]
     if len(frags) > limit:  # 取首行与末行，兼顾跨多行的 old
@@ -763,13 +765,19 @@ def _probe_fragments(old, limit=3):
     return frags[:limit]
 
 
+def _mark(line):
+    """标出行内不可见字符：行尾空格显示为 ␣、Tab 显示为 ⇥。"""
+    return line.rstrip(" \t").replace("\t", "⇥") + (
+        " " + "␣" * (len(line) - len(line.rstrip(" "))))
+
+
 def _candidates(text, old, spans, limit=5):
-    """生成定位报告：已命中的位置，或与 old 最接近的行。"""
+    """生成定位报告：已命中的位置，或与 old 最接近的行（原样，便于直接复制）。"""
     if spans:
         out = []
         for a, _ in spans[:limit]:
             out.append("  第 %d 行: %s" % (
-                _line_of(text, a), _truncate(_line_text(text, a).strip(), 160)))
+                text.count("\n", 0, a) + 1, _mark(_line_text(text, a))))
         if len(spans) > limit:
             out.append("  ... 等共 %d 处" % len(spans))
         return "候选位置:\n" + "\n".join(out)
@@ -783,7 +791,7 @@ def _candidates(text, old, spans, limit=5):
             i = text.find(needle, start)
             if i < 0:
                 break
-            ln = _line_of(text, i)  # 1 基行号
+            ln = text.count("\n", 0, i) + 1  # 1 基行号
             if ln not in seen:
                 seen.add(ln)
                 hits.append(ln)
@@ -793,8 +801,10 @@ def _candidates(text, old, spans, limit=5):
     if not hits:
         return ("未找到相近内容（文件共 %d 行）。请用 read_file 确认原文"
                 "（注意空格、缩进，且不要把行号一起复制）。" % len(lines))
-    return "最接近的行:\n" + "\n".join(
-        "  第 %d 行: %s" % (i, _truncate(lines[i - 1].strip(), 160)) for i in hits)
+    return ("未找到 old_string。最接近的行（原样，可直接复制为 old_string）:\n" +
+            "\n".join("  第 %d 行: %s" % (i, _mark(lines[i - 1])) for i in hits) +
+            "\n提示: 上面的行已按原样给出，行尾空格标为 ␣、Tab 标为 ⇥；"
+            "复制时请原样包含这些空白。")
 
 
 def _diff_block(old_block, new_block, context=1, limit=24):
@@ -820,7 +830,13 @@ def _apply_edit(text, edit):
     replace_all = bool(edit.get("replace_all"))
     spans, note = _locate(text, old)
     if not spans:
-        return text, 0, "", "", "错误: 未找到 old_string。\n" + _candidates(text, old, [])
+        # 精确 + 忽略行尾空白都未命中时，做一次「整行探测」降级：
+        # old_string 只是漏/多了行尾空白或分号，就用文件里那一整行的原文来替换。
+        cand, cnote = _locate_tolerant(text, old)
+        if cand:
+            spans, note = cand, cnote
+        else:
+            return text, 0, "", "", "错误: 未找到 old_string。\n" + _candidates(text, old, [])
     if len(spans) > 1 and not replace_all:
         return text, 0, "", "", (
             "错误: old_string 在文件中出现 %d 次，不唯一。可补充上下文使其唯一，"
@@ -896,7 +912,7 @@ def _edit_existing_file(path, shown, args):
         return "错误: 写入失败: %s" % e
 
     head = "已修改 %s（共替换 %d 处%s）" % (
-        shown, total, "，已忽略行尾空白/CRLF 差异" if tolerant else "")
+        shown, total, ("，已按整行匹配（忽略了空白差异）" if tolerant else ""))
     return head + ("\n" + "\n".join(diffs) if diffs else "")
 
 
@@ -1085,12 +1101,6 @@ def tool_run_command(args, opts):
             return err
         if not os.path.isdir(cwd):
             return "错误: cwd 不是目录: %s" % args.get("cwd")
-    elif opts.get("root"):
-        # 默认 cwd（启动目录）同样要受 --root 约束，否则「只能访问 DIR 之内」形同虚设
-        cwd, err = _resolve(cwd, opts)
-        if err:
-            return ("错误: 默认工作目录 %s 越出允许范围（--root %s）。"
-                    "请先 cd 到该目录内再启动，或在参数里显式传 cwd。" % (opts["cwd"], opts["root"]))
 
     if opts["confirm"] and not _confirm("\n[待执行命令]%s %s\n确认执行? [y/N] " % (
             " (cwd=%s)" % cwd if cwd != opts["cwd"] else "", command)):
@@ -1198,29 +1208,32 @@ def call_llm(messages, opts, on_delta=None):
     req.add_header("Accept", "text/event-stream")
     if opts["api_key"]:
         req.add_header("Authorization", "Bearer " + opts["api_key"])
+    _t0 = time.time()
 
     content_parts, reasoning_parts, tool_calls = [], [], []
     raw_lines, total = [], 0
     saw_sse = False
+    usage = None
 
     try:
         resp = urllib.request.urlopen(req, timeout=opts["http_timeout"])
     except urllib.error.HTTPError as e:
-        raise RuntimeError("HTTP %s 错误: %s" % (e.code, _truncate(_decode(e.read()), 2000)))
+        raise RuntimeError("HTTP %s 错误: %s" % (e.code, _truncate(_decode_bytes(e.read())[0], 2000)))
     except urllib.error.URLError as e:
         raise RuntimeError("网络错误: %s" % e.reason)
+    latency_ms = int((time.time() - _t0) * 1000)
 
     try:
         for raw in resp:
             total += len(raw)
             if total > MAX_RESPONSE_BYTES:
                 raise RuntimeError("响应过大（> %d MB），已拒绝" % (MAX_RESPONSE_BYTES // 1048576))
-            line = _decode(raw).strip()
+            line = _decode_bytes(raw)[0].strip()
             if not line:
                 continue
             if not line.startswith("data:"):
                 if not saw_sse:
-                    raw_lines.append(_decode(raw))
+                    raw_lines.append(_decode_bytes(raw)[0])
                 continue
             saw_sse = True
             data = line[5:].strip()
@@ -1236,6 +1249,7 @@ def call_llm(messages, opts, on_delta=None):
                 delta = chunk["choices"][0].get("delta") or {}
             except (KeyError, IndexError, TypeError):
                 continue
+            usage = chunk.get("usage") or usage
             reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
             if reasoning:
                 reasoning_parts.append(reasoning)
@@ -1265,6 +1279,8 @@ def call_llm(messages, opts, on_delta=None):
         msg["reasoning_content"] = reasoning
     if tool_calls:
         msg["tool_calls"] = tool_calls
+    msg["_latency_ms"] = latency_ms
+    msg["_usage"] = usage or {}
     return msg
 
 
@@ -1277,56 +1293,248 @@ def _parse_full_response(text):
     if isinstance(obj, dict) and obj.get("error"):
         raise RuntimeError("接口返回错误: %s" % obj["error"])
     try:
-        return obj["choices"][0]["message"]
+        msg = obj["choices"][0]["message"]
+        msg["_usage"] = obj.get("usage") or {}
+        msg["_latency_ms"] = None
+        return msg
     except (KeyError, IndexError, TypeError):
         raise RuntimeError("响应结构异常: %s" % _truncate(json.dumps(obj, ensure_ascii=False), 2000))
 
 
 # ---------------------------------------------------------------------------
-# 屏幕展示与日志
+# 会话数据库（SQLite）
 # ---------------------------------------------------------------------------
 
-SESSION_MARK = "] SESSION BEGIN "
+def db_open(path):
+    """打开（或创建）.ai.db，建表并把上次崩溃未收尾的会话标记为 crashed。
 
-
-def _count_sessions(path):
-    """统计日志里已有的会话数，用于给本次会话编号。"""
-    mark = SESSION_MARK.encode("utf-8")
-    tail_len = len(mark) - 1
-    count, tail = 0, b""
+    返回连接对象。会话库可能含命令输出乃至密钥，按 0600 创建。
+    """
+    new = not os.path.exists(path)
     try:
-        with open(path, "rb") as f:
-            while True:
-                chunk = f.read(1 << 20)
-                if not chunk:
-                    break
-                data = tail + chunk
-                count += data.count(mark)
-                tail = data[-tail_len:]
-    except Exception:
-        return 1
-    return count + 1
+        conn = sqlite3.connect(path)
+    except Exception as e:
+        sys.stderr.write("无法打开会话数据库 %s: %s\n" % (path, e))
+        return None
+    try:
+        if new:
+            os.chmod(path, 0o600)
+    except OSError:
+        pass
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.executescript(
+        "CREATE TABLE IF NOT EXISTS sessions("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " session_no INTEGER,"
+        " started_at REAL, ended_at REAL, status TEXT,"
+        " model TEXT, base_url TEXT, cwd TEXT, host TEXT, pid INTEGER, bo_version TEXT,"
+        " prompt_tokens INTEGER DEFAULT 0, completion_tokens INTEGER DEFAULT 0,"
+        " title TEXT);"
+        "CREATE TABLE IF NOT EXISTS events("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " session_id INTEGER, seq INTEGER, ts REAL, step INTEGER, kind TEXT,"
+        " role TEXT, content TEXT,"
+        " tool_name TEXT, tool_call_id TEXT, tool_args TEXT, is_error INTEGER DEFAULT 0,"
+        " latency_ms INTEGER, tokens_prompt INTEGER, tokens_completion INTEGER);"
+        "CREATE INDEX IF NOT EXISTS idx_events_sess ON events(session_id, seq);"
+        "CREATE INDEX IF NOT EXISTS idx_events_kind ON events(session_id, kind);")
+    conn.execute("UPDATE sessions SET status='crashed', ended_at=COALESCE(ended_at, ?) "
+                 "WHERE status='running'", (time.time(),))
+    conn.commit()
+    return conn
 
+
+def db_new_session(conn, opts):
+    """插入一条 running 会话，返回 (session_id, session_no)。"""
+    cur = conn.execute(
+        "INSERT INTO sessions(session_no, started_at, ended_at, status, model, base_url,"
+        " cwd, host, pid, bo_version) VALUES(NULL, ?, 0, 'running', ?, ?, ?, ?, ?, ?)",
+        (time.time(), opts["model"], opts["base_url"], opts["cwd"],
+         platform.node(), os.getpid(), BO_VERSION))
+    conn.commit()
+    sid = cur.lastrowid
+    conn.execute("UPDATE sessions SET session_no=? WHERE id=?", (sid, sid))
+    conn.commit()
+    return sid, sid
+
+
+def db_close_session(conn, sid, status):
+    """收尾会话：写入结束时间与最终状态（closed / crashed）。"""
+    if conn is None or sid is None:
+        return
+    conn.execute("UPDATE sessions SET ended_at=?, status=? WHERE id=?",
+                 (time.time(), status, sid))
+    conn.commit()
+
+
+def db_add_event(conn, session_id, step, kind, content="", role=None,
+                 tool_name=None, tool_call_id=None, tool_args=None, is_error=0,
+                 latency_ms=None, tokens_prompt=None, tokens_completion=None):
+    """向指定会话追加一条事件，seq 自增。"""
+    if conn is None:
+        return
+    row = conn.execute("SELECT COALESCE(MAX(seq), 0) FROM events WHERE session_id=?",
+                       (session_id,)).fetchone()
+    conn.execute(
+        "INSERT INTO events(session_id, seq, ts, step, kind, role, content,"
+        " tool_name, tool_call_id, tool_args, is_error, latency_ms,"
+        " tokens_prompt, tokens_completion)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (session_id, (row[0] or 0) + 1, time.time(), step, kind, role, content,
+         tool_name, tool_call_id, tool_args, 1 if is_error else 0, latency_ms,
+         tokens_prompt, tokens_completion))
+    conn.commit()
+    if kind == "user" and content:
+        conn.execute("UPDATE sessions SET title=? WHERE id=? AND title IS NULL",
+                     (_first_line(content)[:60], session_id))
+        conn.commit()
+
+
+def db_bump_tokens(conn, session_id, usage, latency_ms):
+    """把本次请求的 token 用量累计到会话，并把 latency 记到最近一条 assistant 事件。"""
+    if conn is None or session_id is None:
+        return
+    usage = usage or {}
+    conn.execute(
+        "UPDATE sessions SET prompt_tokens=prompt_tokens+?, completion_tokens=completion_tokens+? "
+        "WHERE id=?",
+        (_int(usage.get("prompt_tokens"), 0), _int(usage.get("completion_tokens"), 0), session_id))
+    if latency_ms is not None:
+        row = conn.execute("SELECT id FROM events WHERE session_id=? AND kind='assistant' "
+                           "ORDER BY seq DESC LIMIT 1", (session_id,)).fetchone()
+        if row:
+            conn.execute("UPDATE events SET latency_ms=? WHERE id=?", (latency_ms, row[0]))
+    conn.commit()
+
+
+def db_list_sessions(conn, limit=10):
+    """列出最近若干会话，供 /s 选择。返回行列表。"""
+    return conn.execute(
+        "SELECT id, session_no, title, started_at, status FROM sessions "
+        "ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+
+
+def db_load_session(conn, sid, system_prompt=None):
+    """按 seq 把某会话还原成 messages 列表（含 system 提示词）。
+
+    只取第一条 system 作为系统提示词：每个被载入的会话开头都叠着它自己历史上的
+    system/session_begin（/s、/reset 都会续写），全部还原会把历史撑成一大堆
+    重复的 system 消息。thinking 不入库、不还原；tool_call 还原进 assistant 的
+    tool_calls，tool_result 还原为 role=tool 消息，保持消息历史合法。
+
+    同一步（step）内的多条 tool_call 属于同一条 assistant 消息（模型一次并行调用），
+    这里按 step 合并成一条带多个 tool_calls 的 assistant 消息，使还原后的历史形状
+    与实时对话一致——否则 /s 载入后每个 tool_call 各占一条 assistant，会被
+    _trim_history 当成多个批次，把同一步的调用裁掉一部分。
+
+    老版本库没存 tool_call_id（全为 NULL），直接还原会发出 id 为 null 的 tool_calls，
+    被接口判 HTTP 400「tool_calls.id and tool_calls.type are required」。这里对缺失的
+    id 做合成与配对：有 id 就沿用，缺失就生成占位 id（hist_ 前缀），tool_result 按
+    id 优先、其次按「最早未配对」的顺序回填，保证每个 tool_call 都有结果且一一对应；
+    找不到对应 tool_call 的孤儿 tool_result 直接丢弃，避免消息顺序非法。
+    """
+    messages = []
+    pending = []          # 已还原但还没有结果的 tool_call id（FIFO，按先后顺序配对）
+    group_step = None     # 当前正在聚合的 step
+    group_msg = None      # 当前 step 的 assistant 消息（含 tool_calls）
+    rows = conn.execute(
+        "SELECT step, kind, content, tool_call_id, tool_name, tool_args FROM events "
+        "WHERE session_id=? AND kind IN "
+        "('session_begin','system','user','assistant','tool_call','tool_result','reset','error') "
+        "ORDER BY seq, id", (sid,)).fetchall()
+    for step, kind, content, tid, name, args in rows:
+        # 离开某个 step 的聚合区（遇到别的 step）就收尾，后续 tool_call 才能另起一条消息
+        stepped = kind in ("assistant", "tool_call")
+        if stepped and step != group_step:
+            group_step, group_msg = step, None
+        if kind == "session_begin":
+            continue
+        elif kind == "system":
+            if system_prompt is None:
+                system_prompt = content
+        elif kind == "user":
+            messages.append({"role": "user", "content": content or ""})
+        elif kind == "assistant":
+            group_msg = {"role": "assistant", "content": content or "",
+                         "tool_calls": []}
+            messages.append(group_msg)
+        elif kind == "tool_call":
+            call_id = tid or ("hist_%d_%d" % (sid, len(messages)))
+            pending.append(call_id)
+            if group_msg is not None:
+                # 同一步的后续调用并入同一条 assistant 消息
+                group_msg["tool_calls"].append(
+                    {"id": call_id, "type": "function",
+                     "function": {"name": name or "", "arguments": args or "{}"}})
+            else:
+                group_msg = {"role": "assistant", "content": "",
+                             "tool_calls": [{"id": call_id, "type": "function",
+                                             "function": {"name": name or "",
+                                                          "arguments": args or "{}"}}]}
+                messages.append(group_msg)
+        elif kind == "tool_result":
+            if tid and tid in pending:
+                pending.remove(tid)
+                call_id = tid
+            elif pending:
+                call_id = pending.pop(0)   # id 缺失/对不上：按顺序配给最早未配对的那次调用
+            else:
+                continue                   # 没有对应的 tool_call，丢弃以免消息顺序非法
+            messages.append({"role": "tool", "tool_call_id": call_id, "content": content or ""})
+    # 只有正文、没有工具调用的 assistant：去掉空 tool_calls 列表（留着会发出
+    # tool_calls: []，部分接口判为非法字段）
+    for m in messages:
+        if not m.get("tool_calls"):
+            m.pop("tool_calls", None)
+    if system_prompt is not None:
+        messages.insert(0, {"role": "system", "content": system_prompt})
+    return messages
+
+
+
+
+def choose_session(conn):
+    """交互式列出最近会话并让用户选择。返回选中的 session_id 或 None。"""
+    rows = db_list_sessions(conn, 10)
+    if not rows:
+        sys.stdout.write("还没有历史会话。\n")
+        return None
+    for sid, no, title, started, status in rows:
+        ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(started or 0))
+        label = (title or "(无标题)")
+        sys.stdout.write("  [%d] %s  %s  (%s)\n" % (sid, label[:40], ts, status))
+    try:
+        choice = input("载入哪个会话？输编号（回车取消）> ").strip()
+    except (EOFError, KeyboardInterrupt):
+        sys.stdout.write("\n已取消。\n")
+        return None
+    if not choice:
+        return None
+    try:
+        sid = int(choice)
+    except ValueError:
+        sys.stdout.write("不是有效编号。\n")
+        return None
+    if not any(r[0] == sid for r in rows):
+        sys.stdout.write("没有该会话。\n")
+        return None
+    return sid
+
+
+# ---------------------------------------------------------------------------
+# 屏幕展示（日志已改为写入 .ai.db）
+# ---------------------------------------------------------------------------
 
 class Output(object):
-    """屏幕分级展示 + 完整日志落盘。"""
+    """屏幕分级展示。完整记录统一写入会话数据库，不再写文本日志。"""
 
     RESET, DIM, RED, CYAN = "\033[0m", "\033[2m", "\033[31m", "\033[36m"
 
-    def __init__(self, level, color, log_path):
-        self.level, self.color, self.log_path = level, color, log_path
-        self._log = None
+    def __init__(self, level, color, conn, session_id):
+        self.level, self.color = level, color
+        self.conn, self.session_id = conn, session_id
         self._stream_open = None
-        self.session_id = 0
-        if log_path:
-            self.session_id = _count_sessions(log_path)
-            try:
-                # 日志可能含命令输出乃至密钥，按 0600 创建，仅本人可读
-                fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-                self._log = os.fdopen(fd, "a", encoding="utf-8")
-            except Exception as e:
-                sys.stderr.write("无法打开日志文件 %s: %s\n" % (log_path, e))
-                self.log_path = None
+        self.step = 0
 
     def _c(self, text, code):
         return text if not self.color else code + text + self.RESET
@@ -1335,21 +1543,39 @@ class Output(object):
         sys.stdout.write(text)
         sys.stdout.flush()
 
-    def close(self):
-        if self._log is not None:
-            try:
-                self._log.close()
-            except Exception:
-                pass
-            self._log = None
+    # 常规事件的入库参数表: kind -> (入库 kind, 固定 step 或 None=用当前 step, role)
+    _LOG_MAP = {
+        "SESSION BEGIN": ("session_begin", 0, None),
+        "SYSTEM": ("system", 0, "system"),
+        "USER": ("user", 0, "user"),
+        "ASSISTANT": ("assistant", None, "assistant"),
+        "TRIM": ("trim", None, None),
+        "RESET": ("reset", 0, None),
+        "ERROR": ("error", None, None),
+        "SESSION END": ("session_end", 0, None),
+    }
 
-    # 日志与显示级别无关，始终记录完整内容；每条记录用 END 标记收尾，便于在长内容中定位
-    def log(self, kind, text):
-        if self._log is None:
-            return
-        self._log.write("\n===== [%s] %s =====\n%s\n===== END %s =====\n" % (
-            time.strftime("%Y-%m-%d %H:%M:%S"), kind, text if text else "(空)", kind))
-        self._log.flush()
+    # 日志与显示级别无关，始终记录完整内容
+    def log(self, kind, text, step=None, tool_call_id=None):
+        """按事件类型入库：对应旧文本日志的各类条目。tool_call_id 供 tool_call/tool_result 配对。"""
+        if self.conn is None or kind == "THINKING":
+            return  # 无会话库 / 思考不落库
+        st = self.step if step is None else step
+        if kind.startswith("TOOL_CALL "):
+            db_add_event(self.conn, self.session_id, st, "tool_call", "",
+                         tool_name=kind[len("TOOL_CALL "):], tool_args=text,
+                         tool_call_id=tool_call_id)
+        elif kind.startswith("TOOL_RESULT "):
+            db_add_event(self.conn, self.session_id, st, "tool_result", text, role="tool",
+                         tool_name=kind[len("TOOL_RESULT "):], tool_call_id=tool_call_id,
+                         is_error=1 if _is_error(text) else 0)
+        else:
+            entry = self._LOG_MAP.get(kind)
+            if entry is None:
+                return
+            db_kind, fixed_step, role = entry
+            db_add_event(self.conn, self.session_id,
+                         st if fixed_step is None else fixed_step, db_kind, text, role=role)
 
     def assistant(self, text, is_final):
         if text and (self.level > LEVEL_QUIET or is_final):
@@ -1444,37 +1670,42 @@ def build_system_prompt(opts):
 # 对话主循环
 # ---------------------------------------------------------------------------
 
-def _trim_history(messages, keep_turns=TRIM_KEEP_TURNS):
-    """移除较早轮次里的工具调用与工具结果，只保留最近 keep_turns 轮的完整工具往返。
+def _trim_history(messages, keep_calls=TRIM_KEEP_CALLS):
+    """移除较早的工具调用与结果，只保留最近 keep_calls 次调用批次。
 
-    轮次以 role == "user" 的消息为界（system 消息始终保留）。被移除的是「上上轮及之前」的：
-      - role == "tool" 的结果消息；
-      - assistant 消息的 tool_calls 字段（去掉后 content 为空则整条删除）。
-    user 的输入与 assistant 的正文都保留，因此对话主线还在，只有工具往返被清掉。
-    返回被移除的消息条数。
+    一个批次 = 一条带 tool_calls 的 assistant 消息 + 其后对应的 role=tool 结果。
+    被移除的是更早批次的 tool 结果消息，以及 assistant 消息的 tool_calls 字段
+    （去掉后 content 为空则整条删除）；system 以及所有 user/assistant 正文都保留，
+    因此对话主线完整，只有旧的工具往返被清掉。思考（reasoning）从不进入 messages，
+    自然也不会被还原或裁剪。返回被移除的消息条数。
     """
-    starts = [i for i, m in enumerate(messages) if m.get("role") == "user"]
-    if len(starts) <= keep_turns:
-        return 0
-    cut = starts[len(starts) - keep_turns]  # 需要完整保留的第一条 user 的下标
-    kept = []
+    batches = []          # (assistant 下标, 结果下标列表)
+    cur = None
     for i, m in enumerate(messages):
-        if i >= cut:
-            kept.append(m)
-            continue
         role = m.get("role")
-        if role == "tool":
-            continue
-        if role == "assistant" and m.get("tool_calls"):
-            m = {k: v for k, v in m.items() if k != "tool_calls"}
-            if not (m.get("content") or "").strip():
-                continue  # 只剩工具调用、没有正文的助手消息整体丢弃
-        kept.append(m)
-    if len(kept) == len(messages):
+        if role == "assistant":
+            cur = (i, [])
+            batches.append(cur)
+        elif role == "tool" and cur is not None:
+            cur[1].append(i)
+    calls = [b for b in batches if messages[b[0]].get("tool_calls")]
+    if len(calls) <= keep_calls:
         return 0
-    # 丢掉纯工具往返的助手消息后可能出现连续两条 user，合并它们以保持角色交替
+
+    drop = set()
+    for ai, results in calls[:len(calls) - keep_calls]:
+        drop.update(results)
+        m = {k: v for k, v in messages[ai].items() if k != "tool_calls"}
+        if (m.get("content") or "").strip():
+            messages[ai] = m      # 有正文，只摘掉 tool_calls
+        else:
+            drop.add(ai)          # 纯工具调用、没有正文的助手消息整体丢弃
+    if not drop:
+        return 0
     merged = []
-    for m in kept:
+    for i, m in enumerate(messages):
+        if i in drop:
+            continue
         if merged and merged[-1].get("role") == "user" and m.get("role") == "user":
             merged[-1] = {"role": "user",
                           "content": (merged[-1].get("content") or "") + "\n\n" + (m.get("content") or "")}
@@ -1501,11 +1732,50 @@ def _close_dangling_tool_calls(messages, note):
     return 0
 
 
+def _close_tool_calls(messages):
+    """给每条缺结果的 tool_calls 就地补一条结果，保持消息历史合法。返回补了几条。
+
+    悬空结果会被插到对应 assistant 消息之后（而不是整体追加到末尾），
+    避免消息顺序错乱。裁剪后的历史里较晚批次不受影响。
+    """
+    answered = set(m.get("tool_call_id") for m in messages if m.get("role") == "tool")
+    fixed = 0
+    out = []
+    for m in messages:
+        out.append(m)
+        if m.get("role") != "assistant" or not m.get("tool_calls"):
+            continue
+        for tc in m["tool_calls"]:
+            if tc.get("id") not in answered:
+                out.append({"role": "tool", "tool_call_id": tc.get("id"),
+                            "content": "错误: 该工具调用被中断或未执行完成。"})
+                fixed += 1
+    if fixed:
+        messages[:] = out
+    return fixed
+
+
+def load_history(conn, sid, system_prompt):
+    """从库里还原会话并瘦身：和正常对话一样只保留最近一次工具调用。
+
+    /s 载入与 run_turn 内的裁剪走同一个 _trim_history，保证历史重载后发给模型
+    的形状与实时对话一致；思考从不入库，因此也不会被还原。
+    """
+    messages = db_load_session(conn, sid, system_prompt)
+    dropped = _trim_history(messages)
+    if dropped:
+        sys.stdout.write("历史载入已裁剪较早的工具调用: 移除 %d 条消息。\n" % dropped)
+    fixed = _close_tool_calls(messages)
+    if fixed:
+        sys.stdout.write("历史载入补齐了 %d 条未执行完的工具结果。\n" % fixed)
+    return messages
+
+
 def run_turn(user_text, messages, opts, out):
     out.log("USER", user_text)
     # 本轮内第一次 Ctrl+C 只中断本轮（见 _handle_sigint）；busy 由 main 在结束时复位
     _INTERRUPT["busy"], _INTERRUPT["seen"] = True, False
-    # 每轮开始前先瘦身：只保留最近 keep_turns 轮的工具往返，更早的调用与结果全部移除
+    # 每轮开始前先瘦身：只保留最近一次工具调用批次，更早的调用与结果全部移除
     dropped = _trim_history(messages)
     if dropped:
         out.log("TRIM", "已移除较早轮次的工具调用与结果: %d 条消息" % dropped)
@@ -1513,6 +1783,7 @@ def run_turn(user_text, messages, opts, out):
     repeat = {"key": None, "n": 0}  # 连续相同工具调用的护栏
 
     for _ in range(opts["max_steps"]):
+        out.step += 1
         # 流式回调：边收边打印；正文始终实时显示，思考仅在 verbose 级别显示
         stream_gap = {"content": False}
         cur_kind = {"v": None}
@@ -1554,6 +1825,7 @@ def run_turn(user_text, messages, opts, out):
             out.log("THINKING", reasoning.strip())
         if content:
             out.log("ASSISTANT", content)
+        db_bump_tokens(out.conn, out.session_id, msg.get("_usage"), msg.get("_latency_ms"))
         # content 为空但 quiet 级别下未打印过任何正文时，兜底显示
         if content and out.level == LEVEL_QUIET and not tool_calls:
             out.assistant(content, True)
@@ -1571,7 +1843,7 @@ def run_turn(user_text, messages, opts, out):
         for tc in tool_calls:
             fn = tc.get("function") or {}
             name, raw_args = fn.get("name"), fn.get("arguments") or "{}"
-            out.log("TOOL_CALL " + (name or "?"), raw_args)
+            out.log("TOOL_CALL " + (name or "?"), raw_args, tool_call_id=tc.get("id"))
             out.tool_call(name, raw_args)
             if aborted:
                 result = abort_note
@@ -1607,15 +1879,18 @@ def run_turn(user_text, messages, opts, out):
                         abort_note = "错误: 本轮已被 Ctrl+C 中断，本次调用未执行。"
                         abort_info = "已中断本轮（Ctrl+C），再按一次 Ctrl+C 退出程序"
 
-            out.log("TOOL_RESULT " + (name or "?"), result)
+            out.log("TOOL_RESULT " + (name or "?"), result, tool_call_id=tc.get("id"))
             out.tool_result(result, _is_error(result))
             messages.append({"role": "tool", "tool_call_id": tc.get("id"), "content": result})
 
         if aborted:
             out.info("\n[%s]" % abort_info)
+            # 本轮中止时可能还有 tool_calls 没走完，补齐结果，避免历史悬空
+            _close_tool_calls(messages)
             return
 
     out.info("\n[已达单轮工具调用上限 %d，停止本轮]" % opts["max_steps"])
+    _close_tool_calls(messages)
 
 
 # ---------------------------------------------------------------------------
@@ -1629,8 +1904,8 @@ def parse_args():
         description="BO —— 单文件、纯标准库的最小编码智能体",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="注意: --yes 的含义是「命令执行前需人工确认」。不加 --yes 时命令默认直接放行。\n"
-               "显式传入的连接类参数（-m/--model、-b/--base-url、-k/--api-key、-r/--root、"
-               "-s/--max-steps、-t/--http-timeout、-l/--log）会加密记录到当前目录的 .bo，"
+               "显式传入的连接类参数（-m/--model、-b/--base-url、-k/--api-key、"
+               "-s/--max-steps、-t/--http-timeout、-d/--db）会加密记录到用户主目录的 .bo，"
                "之后不传参或只传部分参数时自动复用；删除 .bo 即恢复默认。"
                "优先级: 命令行 > 环境变量 > .bo > 内置默认。")
     parser.add_argument("-m", "--model", default=S,
@@ -1641,8 +1916,6 @@ def parse_args():
                         help="API 密钥（默认取 OPENAI_API_KEY，其次取 .bo）")
     parser.add_argument("-y", "--yes", action="store_true", dest="confirm",
                         help="开启命令执行前的逐条人工确认（不加则命令默认直接放行）")
-    parser.add_argument("-r", "--root", default=S, metavar="DIR",
-                        help="限制文件类工具（read_file/write_file/search）与 run_command 的 cwd 只能访问该目录之内（默认不限制）")
     parser.add_argument("-s", "--max-steps", type=int, default=S, help="单轮最多工具调用轮数")
     parser.add_argument("-t", "--http-timeout", type=int, default=S, help="单次 HTTP 请求超时秒数")
     parser.add_argument("-q", "--quiet", action="store_true",
@@ -1651,14 +1924,12 @@ def parse_args():
                         help="提高显示级别：-v 显示工具结果与思考，-vv 显示完整明细")
     parser.add_argument("-C", "--no-color", action="store_true",
                         help="关闭彩色输出（默认仅在终端下着色）")
-    parser.add_argument("-l", "--log", nargs="?", const="BO.log", default=S, dest="log_path", metavar="FILE",
-                        help="把完整交互记录写入日志文件（默认 BO.log），屏幕上不显示明细")
-    parser.add_argument("-L", "--no-log", action="store_const", const=None, default=S, dest="log_path",
-                        help="撤销已记录的 -l/--log，停止写日志")
+    parser.add_argument("-d", "--db", default=S, dest="db_path", metavar="FILE",
+                        help="会话数据库文件（默认 .ai.db），完整交互记录写入此处")
     a = parser.parse_args()
     a_vars = vars(a)
 
-    cfg_path = os.path.join(os.getcwd(), CONFIG_FILE)
+    cfg_path = CONFIG_FILE
     cfg, cfg_status = load_config(cfg_path)
     used_cfg = []  # 记录本次实际从 .bo 取值的键，用于启动提示
 
@@ -1678,19 +1949,10 @@ def parse_args():
     # 空字符串环境变量按「未设置」处理，否则会覆盖掉默认接口地址
     base_url = pick("base_url", env("OPENAI_BASE_URL") or None, "https://api.openai.com/v1")
     api_key = pick("api_key", env("OPENAI_API_KEY") or None, "")
-    root = pick("root", None, None)
-    root = os.path.realpath(root) if root else None
     max_steps = pick("max_steps", None, 50)
     http_timeout = pick("http_timeout", None, 120)
-
-    # 日志：-l/--log 设置，--no-log 显式清空（清空需与「未传参」区分，故单独处理）
-    if "log_path" in a_vars:
-        log_path = a_vars["log_path"]
-    elif "log_path" in cfg:
-        used_cfg.append("log_path")
-        log_path = cfg["log_path"]
-    else:
-        log_path = None
+    db_path = pick("db_path", env("BO_DB") or None, DEFAULT_DB_FILE)
+    db_path = os.path.expanduser(db_path)
 
     # 交互与显示开关仅本次生效，不写入 .bo
     confirm = bool(a.confirm)
@@ -1701,8 +1963,8 @@ def parse_args():
         color = False
 
     # 只把本次显式传入的连接类参数写回 .bo，保留文件中其它键（键名同 CONFIG_KEYS）
-    resolved = {"model": model, "base_url": base_url, "api_key": api_key, "root": root,
-                "max_steps": max_steps, "http_timeout": http_timeout, "log_path": log_path}
+    resolved = {"model": model, "base_url": base_url, "api_key": api_key,
+                "max_steps": max_steps, "http_timeout": http_timeout, "db_path": db_path}
     updates = {k: resolved[k] for k in CONFIG_KEYS if k in a_vars}
 
     config_saved, config_error = False, None
@@ -1715,9 +1977,9 @@ def parse_args():
 
     return {
         "model": model, "base_url": base_url, "api_key": api_key,
-        "confirm": confirm, "root": root,
+        "confirm": confirm,
         "max_steps": max_steps, "http_timeout": http_timeout, "cwd": os.getcwd(),
-        "level": level, "color": color, "log_path": log_path,
+        "level": level, "color": color, "db_path": db_path,
         "config_status": cfg_status, "config_saved": config_saved, "config_error": config_error,
         "config_used": bool(used_cfg),
     }
@@ -1748,25 +2010,36 @@ def setup_stdio():
             pass
 
 
+def _new_session(opts, out):
+    """关闭旧会话并开启新会话（进程启动与 /reset 共用）。"""
+    db_close_session(out.conn, out.session_id, "closed")
+    sid, _no = db_new_session(out.conn, opts)
+    out.session_id = sid
+    out.step = 0
+
+
 def main():
     setup_stdio()
     install_sigint_handler()
 
     opts = parse_args()
-    out = Output(opts["level"], opts["color"], opts["log_path"])
+    conn = db_open(opts["db_path"])
+    if conn is None:
+        sys.stderr.write("无法使用会话数据库，已退出。\n")
+        sys.exit(1)
+    out = Output(opts["level"], opts["color"], conn, None)
+    _new_session(opts, out)
     system_prompt = build_system_prompt(opts)
 
     sys.stdout.write(
         "BO —— 最小编码智能体 (Python %s, %s)\n"
-        "模型: %s\n接口: %s\n命令确认: %s\n显示级别: %s\n"
+        "模型: %s\n接口: %s\n命令确认: %s\n显示级别: %s\n会话: #%d\n"
         % (platform.python_version(), platform.system(), opts["model"], opts["base_url"],
-           "开启 (--yes)" if opts["confirm"] else "关闭 (默认放行)", LEVEL_NAMES[opts["level"]]))
-    if opts["root"]:
-        sys.stdout.write("文件访问限制: %s\n" % opts["root"])
-    if out.log_path:
-        sys.stdout.write("完整日志: %s\n" % out.log_path)
+           "开启 (--yes)" if opts["confirm"] else "关闭 (默认放行)",
+           LEVEL_NAMES[opts["level"]], out.session_id))
+    sys.stdout.write("会话库: %s\n" % opts["db_path"])
     if opts["config_status"] == "invalid":
-        sys.stderr.write("警告: %s 存在但无法解密/解析（或不属于本目录），已忽略\n" % CONFIG_FILE)
+        sys.stderr.write("警告: %s 存在但无法解密/解析（或非本机生成），已忽略\n" % CONFIG_FILE)
     if opts["config_used"]:
         sys.stdout.write("参数记忆: 已从 %s 读取\n" % CONFIG_FILE)
     if opts["config_saved"]:
@@ -1794,13 +2067,41 @@ def main():
                 sys.stdout.write("再见。\n")
                 break
             if user == "/reset":
+                _new_session(opts, out)
                 messages = [{"role": "system", "content": system_prompt}]
-                out.log("RESET", "对话历史已清空")
-                sys.stdout.write("已清空对话历史。\n")
+                out.log("RESET", "对话历史已清空，已开新会话")
+                sys.stdout.write("已清空对话历史，开启新会话 #%d。\n" % out.session_id)
+                continue
+            if user == "/s":
+                try:
+                    sid = choose_session(out.conn)
+                except Exception as e:      # input 被打断/异常时不至于崩掉整个程序
+                    out.log("ERROR", "/s 选择会话失败: %s" % e)
+                    sys.stdout.write("选择会话失败: %s\n" % e)
+                    continue
+                if sid is not None:
+                    loaded = load_history(out.conn, sid, system_prompt)
+                    if loaded:
+                        # 先收尾当前会话与本次新建的空壳，再切回被载入会话续写
+                        prev = out.session_id
+                        _new_session(opts, out)
+                        db_close_session(out.conn, out.session_id, "closed")
+                        out.session_id = sid
+                        out.step = 0
+                        db_close_session(out.conn, sid, "running")
+                        if prev != sid:
+                            out.log("RESET", "已载入会话 #%d（%d 条消息），当前会话 #%d 已收尾"
+                                    % (sid, len(loaded), prev))
+                        messages[:] = loaded
+                        out.log("RESET", "已载入会话 #%d（%d 条消息）" % (sid, len(loaded)))
+                        sys.stdout.write("已载入会话 #%d，继续对话。\n" % sid)
+                    else:
+                        sys.stdout.write("该会话没有可载入的内容。\n")
                 continue
             if user == "/help":
                 sys.stdout.write("可用交互命令:\n"
-                                 "  /reset   清空对话历史\n"
+                                 "  /reset   清空对话历史，开启新会话\n"
+                                 "  /s       载入并继续某个历史会话\n"
                                  "  /help    显示本帮助\n"
                                  "  exit     退出\n"
                                  "  Ctrl+C   第一次只中断当前一轮（生成/命令），再按一次退出\n")
@@ -1829,8 +2130,16 @@ def main():
         sys.stdout.write("\n再见。\n")
     finally:
         out.log("SESSION END", "编号: %d\n耗时: %.1fs" % (out.session_id, time.time() - started))
-        out.close()
+        db_close_session(out.conn, out.session_id, "closed")
+        try:
+            out.conn.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
     main()
+
+
+
+
