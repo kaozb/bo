@@ -1193,6 +1193,35 @@ def _merge_tool_call_delta(acc, delta):
             slot["function"]["arguments"] += fn["arguments"]
 
 
+def fetch_models(opts):
+    """Request /models and return the model ids the endpoint supports (in the endpoint's own order)."""
+    url = opts["base_url"].rstrip("/") + "/models"
+    req = urllib.request.Request(url, method="GET")
+    if opts["api_key"]:
+        req.add_header("Authorization", "Bearer " + opts["api_key"])
+    try:
+        resp = urllib.request.urlopen(req, timeout=opts["http_timeout"])
+    except urllib.error.HTTPError as e:
+        raise RuntimeError("HTTP %s error: %s" % (e.code, _truncate(_decode_bytes(e.read())[0], 2000)))
+    except urllib.error.URLError as e:
+        raise RuntimeError("network error: %s" % e.reason)
+    try:
+        raw = resp.read(MAX_RESPONSE_BYTES + 1)
+    except Exception as e:
+        raise RuntimeError("failed to read the response: %s" % e)
+    if len(raw) > MAX_RESPONSE_BYTES:
+        raise RuntimeError("response too large (> %d MB), refused" % (MAX_RESPONSE_BYTES // 1048576))
+    try:
+        obj = json.loads(_decode_bytes(raw)[0])
+        items = obj["data"]
+    except (ValueError, KeyError, TypeError):
+        raise RuntimeError("response is not a model list: %s" % _truncate(_decode_bytes(raw)[0], 2000))
+    ids = [i["id"] for i in items if isinstance(i, dict) and i.get("id")]
+    if not ids:
+        raise RuntimeError("the endpoint returned no models")
+    return ids
+
+
 def call_llm(messages, opts, on_delta=None):
     """Stream a request to /chat/completions, returning the aggregated message dict.
 
@@ -1531,6 +1560,29 @@ def choose_session(conn):
         sys.stdout.write("no such session.\n")
         return None
     return sid
+
+
+def choose_model(opts):
+    """List the models the endpoint supports and let the user pick one by number. Returns the chosen model name or None."""
+    ids = fetch_models(opts)
+    for i, mid in enumerate(ids):
+        sys.stdout.write("  [%d] %s\n" % (i + 1, mid))
+    try:
+        choice = input("which model? enter a number (Enter to cancel) > ").strip()
+    except (EOFError, KeyboardInterrupt):
+        sys.stdout.write("\ncancelled.\n")
+        return None
+    if not choice:
+        return None
+    try:
+        idx = int(choice)
+    except ValueError:
+        sys.stdout.write("not a valid number.\n")
+        return None
+    if idx < 1 or idx > len(ids):
+        sys.stdout.write("no such model.\n")
+        return None
+    return ids[idx - 1]
 
 
 # ---------------------------------------------------------------------------
@@ -2034,6 +2086,8 @@ def parse_args():
                         help="disable colored output (by default color is used only on a terminal)")
     parser.add_argument("-d", "--db", default=S, dest="db_path", metavar="FILE",
                         help="session database file (default .ai.db), the full interaction record is written here")
+    parser.add_argument("-l", "--list-models", action="store_true", dest="list_models",
+                        help="list the models the endpoint supports, pick one by number, write it to .bo and exit")
     a = parser.parse_args()
     a_vars = vars(a)
 
@@ -2082,6 +2136,30 @@ def parse_args():
         if merged != cfg:  # do not rewrite when nothing changed, to avoid pointless file modification
             config_error = save_config(merged, cfg_path)
             config_saved = config_error is None
+
+    # -l only does "list models -> pick a number -> save", equivalent to passing -m once, then exits
+    if a.list_models:
+        try:
+            chosen = choose_model({"base_url": base_url, "api_key": api_key,
+                                   "http_timeout": http_timeout})
+        except RuntimeError as e:
+            sys.stderr.write("failed to fetch the model list: %s\n" % e)
+            sys.exit(1)
+        except Exception as e:
+            sys.stderr.write("failed to fetch the model list: %s: %s\n" % (type(e).__name__, e))
+            sys.exit(1)
+        if chosen is None:
+            sys.stdout.write("model unchanged.\n")
+            sys.exit(0)
+        merged = dict(cfg)      # start from the connection options just saved this run, so they are not overwritten
+        merged.update(updates)
+        merged["model"] = chosen
+        err = save_config(merged, cfg_path)
+        if err:
+            sys.stderr.write("warning: failed to write %s: %s\n" % (cfg_path, err))
+            sys.exit(1)
+        sys.stdout.write("model switched to %s, written to %s.\n" % (chosen, CONFIG_FILE))
+        sys.exit(0)
 
     return {
         "model": model, "base_url": base_url, "api_key": api_key,

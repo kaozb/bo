@@ -1193,6 +1193,35 @@ def _merge_tool_call_delta(acc, delta):
             slot["function"]["arguments"] += fn["arguments"]
 
 
+def fetch_models(opts):
+    """请求 /models，返回接口支持的模型 id 列表（按接口原序）。"""
+    url = opts["base_url"].rstrip("/") + "/models"
+    req = urllib.request.Request(url, method="GET")
+    if opts["api_key"]:
+        req.add_header("Authorization", "Bearer " + opts["api_key"])
+    try:
+        resp = urllib.request.urlopen(req, timeout=opts["http_timeout"])
+    except urllib.error.HTTPError as e:
+        raise RuntimeError("HTTP %s 错误: %s" % (e.code, _truncate(_decode_bytes(e.read())[0], 2000)))
+    except urllib.error.URLError as e:
+        raise RuntimeError("网络错误: %s" % e.reason)
+    try:
+        raw = resp.read(MAX_RESPONSE_BYTES + 1)
+    except Exception as e:
+        raise RuntimeError("读取响应失败: %s" % e)
+    if len(raw) > MAX_RESPONSE_BYTES:
+        raise RuntimeError("响应过大（> %d MB），已拒绝" % (MAX_RESPONSE_BYTES // 1048576))
+    try:
+        obj = json.loads(_decode_bytes(raw)[0])
+        items = obj["data"]
+    except (ValueError, KeyError, TypeError):
+        raise RuntimeError("响应无法解析为模型清单: %s" % _truncate(_decode_bytes(raw)[0], 2000))
+    ids = [i["id"] for i in items if isinstance(i, dict) and i.get("id")]
+    if not ids:
+        raise RuntimeError("接口未返回任何模型")
+    return ids
+
+
 def call_llm(messages, opts, on_delta=None):
     """流式请求 /chat/completions，返回聚合后的 message 字典。
 
@@ -1530,6 +1559,29 @@ def choose_session(conn):
         sys.stdout.write("没有该会话。\n")
         return None
     return sid
+
+
+def choose_model(opts):
+    """列出接口支持的模型并让用户按编号选择。返回选中的模型名或 None。"""
+    ids = fetch_models(opts)
+    for i, mid in enumerate(ids):
+        sys.stdout.write("  [%d] %s\n" % (i + 1, mid))
+    try:
+        choice = input("选择哪个模型？输编号（回车取消）> ").strip()
+    except (EOFError, KeyboardInterrupt):
+        sys.stdout.write("\n已取消。\n")
+        return None
+    if not choice:
+        return None
+    try:
+        idx = int(choice)
+    except ValueError:
+        sys.stdout.write("不是有效编号。\n")
+        return None
+    if idx < 1 or idx > len(ids):
+        sys.stdout.write("没有该模型。\n")
+        return None
+    return ids[idx - 1]
 
 
 # ---------------------------------------------------------------------------
@@ -2031,6 +2083,8 @@ def parse_args():
                         help="关闭彩色输出（默认仅在终端下着色）")
     parser.add_argument("-d", "--db", default=S, dest="db_path", metavar="FILE",
                         help="会话数据库文件（默认 .ai.db），完整交互记录写入此处")
+    parser.add_argument("-l", "--list-models", action="store_true", dest="list_models",
+                        help="列出接口支持的模型，按编号选择后写入 .bo 并退出")
     a = parser.parse_args()
     a_vars = vars(a)
 
@@ -2079,6 +2133,30 @@ def parse_args():
         if merged != cfg:  # 无变化则不重写，避免无谓地改动文件
             config_error = save_config(merged, cfg_path)
             config_saved = config_error is None
+
+    # -l 只做「列模型 → 选编号 → 落盘」，等价于执行一次 -m，随即退出
+    if a.list_models:
+        try:
+            chosen = choose_model({"base_url": base_url, "api_key": api_key,
+                                   "http_timeout": http_timeout})
+        except RuntimeError as e:
+            sys.stderr.write("获取模型清单失败: %s\n" % e)
+            sys.exit(1)
+        except Exception as e:
+            sys.stderr.write("获取模型清单失败: %s: %s\n" % (type(e).__name__, e))
+            sys.exit(1)
+        if chosen is None:
+            sys.stdout.write("未切换模型。\n")
+            sys.exit(0)
+        merged = dict(cfg)      # 基于本次已落盘的连接参数，避免后续覆盖掉它们
+        merged.update(updates)
+        merged["model"] = chosen
+        err = save_config(merged, cfg_path)
+        if err:
+            sys.stderr.write("警告: 写入 %s 失败: %s\n" % (cfg_path, err))
+            sys.exit(1)
+        sys.stdout.write("模型已切换为 %s，已写入 %s。\n" % (chosen, CONFIG_FILE))
+        sys.exit(0)
 
     return {
         "model": model, "base_url": base_url, "api_key": api_key,

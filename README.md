@@ -17,6 +17,7 @@
 - `-y, --yes` 命令逐条确认
 - 常用参数同时支持单字母与全名（`-m` / `--model`、`-b` / `--base-url`、`-k` / `--api-key` 等）
 - 参数记忆：连接类参数加密写入用户主目录的 `.bo`，下次自动复用
+- `-l, --list-models` 列出接口支持的模型，按编号选择后写入 `.bo` 并退出
 - 读取与整体写入有 3 MB 上限，超过的文件请用 `run_command` 配合 `head` / `tail` / `sed`
 
 ## 环境要求
@@ -56,6 +57,7 @@ python3 bo_en.py     # 英文版
 3. **留档**：默认写入 `.ai.db`；用 `-d FILE` 换个会话库文件
 4. **翻旧账**：启动后输入 `/s`，从最近 10 个会话里挑一个继续
 5. **换模型/接口**：`-m` / `-b` / `-k`
+6. **不知道有哪些模型**：`python3 bo.py -l`，从接口拉取模型清单按编号选一个，写入 `.bo` 后退出
 
 ```bash
 python3 bo_en.py -y -v -d ~/sessions/my.db -m deepseek-chat
@@ -76,6 +78,7 @@ python3 bo_en.py -y -v -d ~/sessions/my.db -m deepseek-chat
 | `-q` / `-v` / `-vv` | 只显示最终答复 / 工具结果与思考 / 完整明细 |
 | `-C, --no-color` | 关闭彩色输出（默认仅在终端下着色） |
 | `-d, --db FILE` | 会话数据库文件（默认 `.ai.db`），完整交互记录写入此处；也可用环境变量 `BO_DB` 指定 |
+| `-l, --list-models` | 列出接口支持的模型，按编号选择后写入 `.bo` 并退出 |
 
 优先级：**命令行 > 环境变量 > `.bo` > 内置默认**。只有连接类参数（`-m`、`-b`、`-k`、`-s`、`-t`、`-d`）会加密写入用户主目录的 `.bo`（0600）并在下次复用；`-y`、`-q`/`-v`、`-C` 仅本次生效，不写入该文件。`.bo` 的密钥由所在目录路径派生，与目录绑定：换机器或换用户后无法解密，会被当作无效配置忽略；删除 `.bo` 即恢复默认。**文件可能含 API 密钥，请勿提交**。
 
@@ -121,6 +124,7 @@ A single-file, standard-library-only minimal coding agent. Any machine running P
 - `-y, --yes` to confirm each command
 - Common options take both a short and a long form (`-m` / `--model`, `-b` / `--base-url`, `-k` / `--api-key`, ...)
 - Option memory: connection options are encrypted into `.bo` in your home directory and reused later
+- `-l, --list-models` lists the models the endpoint supports; pick one by number, it is written to `.bo` and the program exits
 - Reads and whole-file writes are capped at 3 MB; for larger files use `run_command` with `head` / `tail` / `sed`
 
 ## Requirements
@@ -160,6 +164,7 @@ Common practices:
 3. **Keep a record**: written to `.ai.db` by default; use `-d FILE` for a different database file
 4. **Resume a session**: type `/s` and pick one of the last 10 sessions to continue
 5. **Swap model/endpoint**: `-m` / `-b` / `-k`
+6. **Not sure which models exist**: run `python3 bo_en.py -l`, pick one from the endpoint's model list by number, it is written to `.bo` and the program exits
 
 ```bash
 python3 bo_en.py -y -v -d ~/sessions/my.db -m deepseek-chat
@@ -180,6 +185,7 @@ Every common option accepts both a short and a long form, e.g. `-b` is the same 
 | `-q` / `-v` / `-vv` | final answer only / tool results and thinking / full detail |
 | `-C, --no-color` | disable colored output (colors only on a terminal by default) |
 | `-d, --db FILE` | session database file (default `.ai.db`) holding the full interaction record; the `BO_DB` environment variable works too |
+| `-l, --list-models` | list the models the endpoint supports, pick one by number, write it to `.bo` and exit |
 
 Precedence: **command line > environment variable > `.bo` > built-in default**. Only connection options (`-m`, `-b`, `-k`, `-s`, `-t`, `-d`) are encrypted into `.bo` in your home directory (0600) and reused next time; `-y`, `-q`/`-v`, `-C` apply to the current run only and are not written there. The `.bo` key is derived from the directory path and bound to it: on another machine or as another user it cannot be decrypted and is ignored as invalid; delete `.bo` to reset. **The file may contain your API key, so do not commit it**.
 
