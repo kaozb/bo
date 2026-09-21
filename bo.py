@@ -2191,7 +2191,7 @@ def main():
                         db_close_session(out.conn, prev, "closed")
                         out.session_id, out.step = sid, 0
                         db_close_session(out.conn, sid, "running")
-                        if prev != sid:
+                        if prev is not None and prev != sid:
                             out.log("RESET", "已载入会话 #%d（%d 条消息），当前会话 #%d 已收尾"
                                     % (sid, len(loaded), prev))
                         messages[:] = loaded

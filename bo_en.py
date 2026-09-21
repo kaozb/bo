@@ -2196,7 +2196,7 @@ def main():
                         db_close_session(out.conn, prev, "closed")
                         out.session_id, out.step = sid, 0
                         db_close_session(out.conn, sid, "running")
-                        if prev != sid:
+                        if prev is not None and prev != sid:
                             out.log("RESET", "loaded session #%d (%d messages), current session #%d was finished"
                                     % (sid, len(loaded), prev))
                         messages[:] = loaded
