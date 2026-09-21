@@ -98,6 +98,9 @@ BO 是单文件、纯标准库的最小编码智能体，走 OpenAI 兼容接口
 完整交互写入 **SQLite 会话库**（默认 `.ai.db`，`-d/--db` 或环境变量 `BO_DB` 指定；sqlite3 是标准库，
 不破坏零依赖）。交互命令：`/reset` 开新会话、`/s` 载入历史会话、`/help`、`exit`。
 
+启动参数：`-m/-b/-k/-s/-t/-d` 为连接类参数（写入 `.bo`），`-y/-q/-v/-C` 仅本次生效；
+`-l/--list-models` 拉取 `/models` 让用户按编号选模型，写入 `.bo` 后直接退出。
+
 文件构成：
 
 - `bo.py`      中文版，**功能改动唯一来源（single source of truth）**，约 2250 行，含可执行位
@@ -242,6 +245,14 @@ t=lambda p:[type(n).__name__ for n in ast.walk(ast.parse(open(p,encoding='utf-8'
 a,b=t('bo.py'),t('bo_en.py'); print(len(a),len(b),a==b)"
 ```
 
+## 模型清单选择（`-l/--list-models`）
+
+- `fetch_models(opts)` 请求 `base_url + /models`（GET，有 key 才带 `Authorization`），读响应受
+  `MAX_RESPONSE_BYTES` 限制；`HTTPError`/`URLError`/非 JSON/缺 `data`/空清单都转 `RuntimeError`（中文文案）。
+- `choose_model(opts)` 打印 `[n] id` 让用户输编号；回车/非数字/越界都只提示并返回 None。
+- `parse_args` 里的 `-l` 分支在**写完本次显式连接参数之后**执行，用 `dict(cfg)+updates+model` 落盘，
+  因此 `.bo` 里其它键（`max_steps`/`http_timeout`/`db_path`）不会被抹掉；未选择则原样退出，不写盘。
+
 ## 常用验证命令
 
 ```bash
@@ -265,6 +276,10 @@ Ctrl+C（含进程组击杀、无孤儿进程）均已实测通过。
   - 第 133 行 `"不能同时使用"` → 应改为断言「已修改 + 提示忽略 content」。
 - Python 3.6 真机（Docker）复测本批改动：sqlite3 是标准库、3.6 理论可用，但**尚未实测**。
 - 开发机 Linux armv7l，Python 3.12.3（代码向下兼容 3.6）；日常用 py36check.py 快检。
+- **测 `.bo` 相关功能务必先 `export HOME=<临时目录>`**：`CONFIG_FILE` 是 `~/.bo`，直接跑会覆盖
+  用户真实配置（曾用假接口 `-b 127.0.0.1` 覆盖过一次，真实 key/base_url/model 已从运行中的
+  `/usr/sbin/ai` 进程内存里捞回：`base_url=https://tokendance.space/gateway/v1`、`model=deepseek-v4.1-flash`）。
+  另：`save_config` 落盘键名与大小写敏感，恢复时用 `bo.save_config(dict, path)` 而非手拼字节。
 - 运行参数记忆优先级：命令行 > 环境变量（含 `BO_DB`）> `.bo` > 内置默认。只有连接类参数
   （`-m`/`-b`/`-k`/`-s`/`-t`/`-d`）写入 `.bo`；`-y`/`-q`/`-v`/`-C` 仅本次生效。
 - `.bo` 密钥由所在目录路径派生，与目录绑定：换机器/换用户无法解密，被当作无效配置忽略。
