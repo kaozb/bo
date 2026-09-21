@@ -19,14 +19,17 @@
     -y, --yes           命令执行前逐条人工确认（不加则默认直接放行）
     -s, --max-steps N   单轮最多工具调用轮数（默认 50）
     -t, --http-timeout N  单次请求超时秒数（默认 120）
+    -T, --tool N        历史里保留最近 N 轮用户输入的完整工具往返（默认 2）
     -q                  只显示最终答复，隐藏全部工具/思考过程
     -v / -vv            显示工具结果与思考 / 完整明细
     -C, --no-color      关闭彩色输出
     -d, --db FILE       会话数据库（默认 .ai.db），完整交互记录写入此处
 
-参数记忆: 显式传入的连接类参数（-m / -b / -k / -s / -t / -d）会加密记录到用户主目录的 .bo，
+参数记忆: 显式传入的连接类参数（-m / -b / -k / -s / -t / -T / -d）会加密记录到用户主目录的 .bo，
           之后不传参或只传部分参数时自动复用；-y / -q / -v / -C 等交互与显示开关仅本次生效，
           不写入该文件。优先级: 命令行 > 环境变量 > .bo > 内置默认；删除 .bo 即恢复默认。
+
+一轮的定义: 一次用户主动输入算一轮，轮内可能有很多次工具调用；--tool 控制保留最近几轮。
 
 交互: /reset 清空并开新会话，/s 载入历史会话，/help 帮助，exit 退出
 """
@@ -68,15 +71,16 @@ MAX_EDITS = 50                       # write_file 单次 edits 数组最多条�
 MAX_COMMAND_TIMEOUT = 3600           # run_command 超时上限（秒）
 MAX_COMMAND_OUTPUT_BYTES = 256 * 1024  # run_command 在内存保留的输出上限（首尾各半，再截到可见长度）
 MAX_DIR_ITEMS = 1000                 # read_file 列目录时单次最多显示的项目数
-MAX_REPEAT_CALLS = 3                 # 同一轮内完全相同的工具调用连续出现该次数即中止本轮
-TRIM_KEEP_CALLS = 1                  # 历史里只保留最近几次工具调用（含其结果），更早的移除
+MAX_REPEAT_CALLS = 3                 # 同一轮内等价的工具调用连续出现该次数即中止本轮
+TRIM_KEEP_ROUNDS = 2                 # 历史里保留最近几轮用户输入的完整工具往返，更早的移除
 SEARCH_SKIP_DIRS = (".git", "__pycache__", "node_modules", ".venv", "venv",
                     ".tox", ".mypy_cache", ".pytest_cache")  # search 跳过的目录
 AGENT_FILE = "AGENTS.md"             # 当前目录下的约定文件（不区分大小写），存在则提示模型自行读取
 CONFIG_FILE = os.path.join(os.path.expanduser("~"), ".bo")
 # 用户主目录下的参数记忆文件（加密），全局共用：显式传参时写入、无参时复用
 # 只有这些「连接/运行类」参数会写入 .bo；交互与显示开关（-y / -q / -v / -C）仅本次生效
-CONFIG_KEYS = ("model", "base_url", "api_key", "max_steps", "http_timeout", "db_path")
+CONFIG_KEYS = ("model", "base_url", "api_key", "max_steps", "http_timeout",
+               "tool_rounds", "db_path")
 DEFAULT_DB_FILE = ".ai.db"              # 默认会话数据库文件名（位于启动目录），可用 -d/--db 指定并记忆
 BO_VERSION = "1.1.0-db"                 # 写入会话库的版本标识
 
@@ -528,7 +532,7 @@ def tool_read_file(args, opts):
     # 逐行拼装并累计字符数：即使 limit 很大，单次输出也不会超出上下文预算
     shown_lines, used, cut = [], 0, False
     for i, ln in enumerate(lines):
-        text = _truncate(ln, MAX_LINE_CHARS, note="... [本行已截断]")
+        text = _truncate(ln, MAX_LINE_CHARS, note="... [本行已截断，原 %d 字符]")
         cost = len(text) + 8  # 行号与换行的大致开销
         if shown_lines and used + cost > MAX_OUTPUT_CHARS:
             cut = True
@@ -983,7 +987,7 @@ def tool_search(args, opts):
             for k in range(max(lo, emitted + 1), hi):
                 sep = ":" if k == i else "-"
                 line = "%s%s%d%s%s" % (
-                    label, sep, k + 1, sep, _truncate(lines[k], MAX_LINE_CHARS, note="... [本行已截断]"))
+                    label, sep, k + 1, sep, _truncate(lines[k], MAX_LINE_CHARS, note="... [本行已截断，原 %d 字符]"))
                 if used + len(line) + 1 > MAX_OUTPUT_CHARS:
                     full = True
                     break
@@ -1315,7 +1319,6 @@ def db_open(path):
     conn.executescript(
         "CREATE TABLE IF NOT EXISTS sessions("
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
-        " session_no INTEGER,"
         " started_at REAL, ended_at REAL, status TEXT,"
         " model TEXT, base_url TEXT, cwd TEXT, host TEXT, pid INTEGER, bo_version TEXT,"
         " prompt_tokens INTEGER DEFAULT 0, completion_tokens INTEGER DEFAULT 0,"
@@ -1335,16 +1338,15 @@ def db_open(path):
 
 
 def db_new_session(conn, opts):
-    """插入一条 running 会话，返回 (session_id, session_no)。"""
+    """插入一条 running 会话，返回 session_id。"""
     cur = conn.execute(
-        "INSERT INTO sessions(session_no, started_at, ended_at, status, model, base_url,"
-        " cwd, host, pid, bo_version) VALUES(NULL, ?, 0, 'running', ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO sessions(started_at, ended_at, status, model, base_url,"
+        " cwd, host, pid, bo_version) VALUES(?, 0, 'running', ?, ?, ?, ?, ?, ?)",
         (time.time(), opts["model"], opts["base_url"], opts["cwd"],
          platform.node(), os.getpid(), BO_VERSION))
     sid = cur.lastrowid
-    conn.execute("UPDATE sessions SET session_no=? WHERE id=?", (sid, sid))
     conn.commit()
-    return sid, sid
+    return sid
 
 
 def db_close_session(conn, sid, status):
@@ -1360,7 +1362,7 @@ def db_add_event(conn, session_id, step, kind, content="", role=None,
                  tool_name=None, tool_call_id=None, tool_args=None, is_error=0,
                  latency_ms=None, tokens_prompt=None, tokens_completion=None):
     """向指定会话追加一条事件，seq 自增。"""
-    if conn is None:
+    if conn is None or session_id is None:
         return
     row = conn.execute("SELECT COALESCE(MAX(seq), 0) FROM events WHERE session_id=?",
                        (session_id,)).fetchone()
@@ -1396,10 +1398,13 @@ def db_bump_tokens(conn, session_id, usage, latency_ms):
 
 
 def db_list_sessions(conn, limit=10):
-    """列出最近若干会话，供 /s 选择。返回行列表。"""
+    """列出最近若干会话，供 /s 选择。返回 (id, title) 行列表。
+
+    会话延迟创建（见 _ensure_session），没聊过就不会建行，因此列表里天然都是有内容的
+    会话，无需再按 title 过滤。
+    """
     return conn.execute(
-        "SELECT id, session_no, title, started_at, status FROM sessions "
-        "ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        "SELECT id, title FROM sessions ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
 
 
 def db_load_session(conn, sid, system_prompt=None):
@@ -1412,17 +1417,13 @@ def db_load_session(conn, sid, system_prompt=None):
 
     同一步（step）内的多条 tool_call 属于同一条 assistant 消息（模型一次并行调用），
     这里按 step 合并成一条带多个 tool_calls 的 assistant 消息，使还原后的历史形状
-    与实时对话一致——否则 /s 载入后每个 tool_call 各占一条 assistant，会被
-    _trim_history 当成多个批次，把同一步的调用裁掉一部分。
+    与实时对话一致——否则 /s 载入后每个 tool_call 各占一条 assistant，形状与实时对话不符。
 
-    老版本库没存 tool_call_id（全为 NULL），直接还原会发出 id 为 null 的 tool_calls，
-    被接口判 HTTP 400「tool_calls.id and tool_calls.type are required」。这里对缺失的
-    id 做合成与配对：有 id 就沿用，缺失就生成占位 id（hist_ 前缀），tool_result 按
-    id 优先、其次按「最早未配对」的顺序回填，保证每个 tool_call 都有结果且一一对应；
-    找不到对应 tool_call 的孤儿 tool_result 直接丢弃，避免消息顺序非法。
+    tool_call_id 由落盘侧保证非空（_parse_tool_calls 只放行可执行的调用），因此这里
+    直接按 id 还原；偶发的空 id 或对不上 tool_result 说明数据损坏，直接丢弃该条，
+    以免发出 id 为 null 的 tool_calls 被接口判 HTTP 400。
     """
     messages = []
-    pending = []          # 已还原但还没有结果的 tool_call id（FIFO，按先后顺序配对）
     group_step = None     # 当前正在聚合的 step
     group_msg = None      # 当前 step 的 assistant 消息（含 tool_calls）
     rows = conn.execute(
@@ -1447,44 +1448,28 @@ def db_load_session(conn, sid, system_prompt=None):
                          "tool_calls": []}
             messages.append(group_msg)
         elif kind == "tool_call":
-            call_id = tid or ("hist_%d_%d" % (sid, len(messages)))
-            pending.append(call_id)
+            if not tid:
+                continue                   # 无 id 的调用无法与结果配对，丢弃
             if group_msg is not None:
                 # 同一步的后续调用并入同一条 assistant 消息
                 group_msg["tool_calls"].append(
-                    {"id": call_id, "type": "function",
+                    {"id": tid, "type": "function",
                      "function": {"name": name or "", "arguments": args or "{}"}})
             else:
                 group_msg = {"role": "assistant", "content": "",
-                             "tool_calls": [{"id": call_id, "type": "function",
+                             "tool_calls": [{"id": tid, "type": "function",
                                              "function": {"name": name or "",
                                                           "arguments": args or "{}"}}]}
                 messages.append(group_msg)
         elif kind == "tool_result":
-            if tid and tid in pending:
-                pending.remove(tid)
-                call_id = tid
-            elif pending:
-                call_id = pending.pop(0)   # id 缺失/对不上：按顺序配给最早未配对的那次调用
-            else:
-                continue                   # 没有对应的 tool_call，丢弃以免消息顺序非法
-            messages.append({"role": "tool", "tool_call_id": call_id, "content": content or ""})
+            if not tid:
+                continue                   # 没有对应 tool_call 的结果，丢弃
+            messages.append({"role": "tool", "tool_call_id": tid, "content": content or ""})
     # 只有正文、没有工具调用的 assistant：去掉空 tool_calls 列表（留着会发出
     # tool_calls: []，部分接口判为非法字段）
     for m in messages:
         if not m.get("tool_calls"):
             m.pop("tool_calls", None)
-    # 旧版落盘时未校验参数，库里可能存着 arguments 非法/残缺的 tool_call（例如仅 "{"
-    # 的截断输出）。这类调用还原出来就是每次请求都 HTTP 400——载入时直接摘掉，
-    # 让老会话也能继续用（比对：落盘侧的 _parse_tool_calls 负责不再产生新的坏记录）。
-    bad_ids = set()
-    for m in messages:
-        for tc in m.get("tool_calls") or []:
-            fn = (tc.get("function") or {}) if isinstance(tc, dict) else {}
-            if not fn.get("name") or _tool_args_error(fn.get("arguments")):
-                bad_ids.add(tc.get("id"))
-    if bad_ids:
-        _drop_tool_calls_by_id(messages, bad_ids)
     if system_prompt is not None:
         messages.insert(0, {"role": "system", "content": system_prompt})
     return messages
@@ -1510,14 +1495,13 @@ def _pick(items, prompt):
 
 
 def choose_session(conn):
-    """交互式列出最近会话并让用户选择。返回选中的 session_id 或 None。"""
+    """交互式列出最近会话并让用户选择。只显示标题；返回选中的 session_id 或 None。"""
     rows = db_list_sessions(conn, 10)
     if not rows:
         sys.stdout.write("还没有历史会话。\n")
         return None
-    items = ["%s  %s  (%s)" % ((title or "(无标题)")[:40],
-             time.strftime("%Y-%m-%d %H:%M", time.localtime(started or 0)), status)
-             for _sid, _no, title, started, status in rows]
+    items = [(title or "(无标题)").strip().replace("\n", " ")[:60]
+             for _sid, title in rows]
     idx = _pick(items, "载入哪个会话？输编号（回车取消）> ")
     return rows[idx][0] if idx is not None else None
 
@@ -1679,36 +1663,35 @@ def build_system_prompt(opts):
 # 对话主循环
 # ---------------------------------------------------------------------------
 
-def _trim_history(messages, keep_calls=TRIM_KEEP_CALLS):
-    """移除较早的工具调用与结果，只保留最近 keep_calls 次调用批次。
+def _trim_history(messages, keep_rounds=TRIM_KEEP_ROUNDS):
+    """按「用户输入轮次」裁剪历史：只保留最近 keep_rounds 轮的完整工具往返。
 
-    一个批次 = 一条带 tool_calls 的 assistant 消息 + 其后对应的 role=tool 结果。
-    被移除的是更早批次的 tool 结果消息，以及 assistant 消息的 tool_calls 字段
-    （去掉后 content 为空则整条删除）；system 以及所有 user/assistant 正文都保留，
-    因此对话主线完整，只有旧的工具往返被清掉。思考（reasoning）从不进入 messages，
-    自然也不会被还原或裁剪。返回被移除的消息条数。
+    一轮 = 一条 user 消息，以及其后到下一个 user 消息之前的全部 assistant/tool 消息；
+    for 循环里同一轮内的多次工具调用（多步）都属于这一轮，绝不因步数被裁。
+    被移除的是更早轮次里的工具往返：tool 结果消息、以及 assistant 消息的 tool_calls
+    字段（去掉后 content 为空则整条删除）；system、所有 user 消息、所有 assistant
+    正文都保留，因此对话主线完整，只有旧轮次的工具往返被清掉。
+    思考（reasoning）从不进入 messages，自然也不会被还原或裁剪。
+    返回被移除的消息条数。
     """
-    batches = []          # (assistant 下标, 结果下标列表)
-    cur = None
-    for i, m in enumerate(messages):
-        role = m.get("role")
-        if role == "assistant":
-            cur = (i, [])
-            batches.append(cur)
-        elif role == "tool" and cur is not None:
-            cur[1].append(i)
-    calls = [b for b in batches if messages[b[0]].get("tool_calls")]
-    if len(calls) <= keep_calls:
+    # 找出每个 user 消息的下标，按它把消息切成「轮」
+    user_idx = [i for i, m in enumerate(messages) if m.get("role") == "user"]
+    if len(user_idx) <= keep_rounds:
         return 0
+    keep_from = user_idx[len(user_idx) - keep_rounds]   # 最近 keep_rounds 轮的起点
 
+    # 移除更早轮次里的工具往返：tool 结果、以及 assistant.tool_calls；最近几轮不动
     drop = set()
-    for ai, results in calls[:len(calls) - keep_calls]:
-        drop.update(results)
-        m = {k: v for k, v in messages[ai].items() if k != "tool_calls"}
-        if (m.get("content") or "").strip():
-            messages[ai] = m      # 有正文，只摘掉 tool_calls
-        else:
-            drop.add(ai)          # 纯工具调用、没有正文的助手消息整体丢弃
+    for i, m in enumerate(messages[:keep_from]):
+        role = m.get("role")
+        if role == "tool":
+            drop.add(i)
+        elif role == "assistant" and m.get("tool_calls"):
+            m = {k: v for k, v in m.items() if k != "tool_calls"}
+            if (m.get("content") or "").strip():
+                messages[i] = m    # 有正文，只摘掉 tool_calls
+            else:
+                drop.add(i)        # 纯工具调用、没有正文的助手消息整体丢弃
     if not drop:
         return 0
     merged = []
@@ -1723,6 +1706,31 @@ def _trim_history(messages, keep_calls=TRIM_KEEP_CALLS):
     dropped = len(messages) - len(merged)
     messages[:] = merged
     return dropped
+
+
+def _repeat_key(name, args):
+    """把一次工具调用归一化成「等价判定」用的 key，供重复调用护栏使用。
+
+    直接拿 raw_args 字符串比对太脆：read_file 的 offset 挪一格、run_command 的
+    timeout 改一改都会被当成「新调用」，同一文件/同一命令实际被反复执行。这里按
+    工具的语义只取「实质参数」：
+      - 文件类（read_file / write_file / edit_file）: 工具名 + 规范化后的路径；
+      - search: 工具名 + pattern + path + glob；
+      - run_command: 工具名 + 命令主体（忽略 cwd / timeout）；
+      - 其它: 回落到参数 JSON 的稳定序列化。
+    参数不是 dict 时同样回落到 JSON，保证不抛异常。
+    """
+    if not isinstance(args, dict):
+        return "%s|%s" % (name, _brief(args, 200))
+    if name in ("read_file", "write_file", "edit_file"):
+        path = args.get("path") or ""
+        return "%s|%s" % (name, os.path.realpath(path) if path else "")
+    if name == "search":
+        return "%s|%s|%s|%s" % (name, args.get("pattern") or "",
+                                args.get("path") or ".", args.get("glob") or "*")
+    if name == "run_command":
+        return "%s|%s" % (name, (args.get("command") or "").strip())
+    return "%s|%s" % (name, json.dumps(args, sort_keys=True, ensure_ascii=False))
 
 
 def _tool_args_error(raw):
@@ -1765,42 +1773,11 @@ def _parse_tool_calls(tool_calls):
     return ok, bad
 
 
-def _drop_tool_calls_by_id(messages, ids):
-    """就地摘掉指定 id 的 tool_calls（及其结果）。
-
-    兜底：保证送到接口与写进库里的 tool_calls 都不含非法参数。正常情况下
-    _parse_tool_calls 已在落盘前拦掉坏调用，这里用于清理历史里残留的旧记录。
-    清理粒度到单个调用：一条 assistant 消息里若还有其它调用则只删除坏的，
-    仅当整条只剩坏调用（且没有正文）时才整条移除；配套的 role=tool 结果一并清掉，
-    避免留下没有对应调用的孤儿结果。
-    """
-    want = set(i for i in ids if i)
-    if not want:
-        return
-    out = []
-    for m in messages:
-        role = m.get("role")
-        if role == "tool" and m.get("tool_call_id") in want:
-            continue                              # 坏调用的结果一并移除
-        if role == "assistant" and m.get("tool_calls"):
-            keep = [tc for tc in m["tool_calls"] if tc.get("id") not in want]
-            if len(keep) != len(m["tool_calls"]):
-                # 必须就地改（不能换成 dict 副本）：调用方可能仍持有同一条消息的引用
-                if keep:
-                    m["tool_calls"] = keep
-                elif (m.get("content") or "").strip():
-                    m.pop("tool_calls", None)     # 有正文，只摘掉 tool_calls
-                else:
-                    continue                      # 纯坏调用、没正文，整条移除
-        out.append(m)
-    messages[:] = out
-
-
 def _close_tool_calls(messages):
     """给每条缺结果的 tool_calls 就地补一条结果，保持消息历史合法。返回补了几条。
 
     悬空结果会被插到对应 assistant 消息之后（而不是整体追加到末尾），
-    避免消息顺序错乱。裁剪后的历史里较晚批次不受影响。
+    避免消息顺序错乱。裁剪后的历史里保留的轮次不受影响。
     """
     answered = set(m.get("tool_call_id") for m in messages if m.get("role") == "tool")
     fixed = 0
@@ -1819,16 +1796,16 @@ def _close_tool_calls(messages):
     return fixed
 
 
-def load_history(conn, sid, system_prompt):
-    """从库里还原会话并瘦身：和正常对话一样只保留最近一次工具调用。
+def load_history(conn, sid, system_prompt, keep_rounds=TRIM_KEEP_ROUNDS):
+    """从库里还原会话并瘦身：和正常对话一样只保留最近若干轮的完整工具往返。
 
     /s 载入与 run_turn 内的裁剪走同一个 _trim_history，保证历史重载后发给模型
     的形状与实时对话一致；思考从不入库，因此也不会被还原。
     """
     messages = db_load_session(conn, sid, system_prompt)
-    dropped = _trim_history(messages)
+    dropped = _trim_history(messages, keep_rounds)
     if dropped:
-        sys.stdout.write("历史载入已裁剪较早的工具调用: 移除 %d 条消息。\n" % dropped)
+        sys.stdout.write("历史载入已裁剪较早轮次的工具调用: 移除 %d 条消息。\n" % dropped)
     fixed = _close_tool_calls(messages)
     if fixed:
         sys.stdout.write("历史载入补齐了 %d 条未执行完的工具结果。\n" % fixed)
@@ -1836,11 +1813,13 @@ def load_history(conn, sid, system_prompt):
 
 
 def run_turn(user_text, messages, opts, out):
+    # 用户真正回话了，此刻才在库里建立会话（延迟创建，见 _new_session/_ensure_session）
+    _ensure_session(opts, out, messages[0].get("content") if messages else None)
     out.log("USER", user_text)
     # 本轮内第一次 Ctrl+C 只中断本轮（见 _handle_sigint）；busy 由 main 在结束时复位
     _INTERRUPT["busy"], _INTERRUPT["seen"] = True, False
-    # 每轮开始前先瘦身：只保留最近一次工具调用批次，更早的调用与结果全部移除
-    dropped = _trim_history(messages)
+    # 每轮开始前先瘦身：只保留最近若干轮的完整工具往返，更早轮次的调用与结果移除
+    dropped = _trim_history(messages, opts["tool_rounds"])
     if dropped:
         out.log("TRIM", "已移除较早轮次的工具调用与结果: %d 条消息" % dropped)
     messages.append({"role": "user", "content": user_text})
@@ -1943,15 +1922,16 @@ def run_turn(user_text, messages, opts, out):
                 messages.append({"role": "tool", "tool_call_id": tc.get("id"), "content": result})
                 continue
 
-            key = "%s|%s" % (name, raw_args)
+            key = _repeat_key(name, args)
             repeat["n"] = repeat["n"] + 1 if key == repeat["key"] else 1
             repeat["key"] = key
             if repeat["n"] >= MAX_REPEAT_CALLS:
                 aborted = True
                 abort_note = "错误: 本轮已因重复调用中止，本次调用未执行。"
-                abort_info = "检测到连续 %d 次完全相同的调用，已停止本轮" % MAX_REPEAT_CALLS
-                result = ("错误: 完全相同的 %s 调用已连续出现 %d 次，已中止本轮，本次调用未执行。"
-                          "请换一种思路，或直接说明结论。" % (name, repeat["n"]))
+                abort_info = "检测到连续 %d 次等价的调用，已停止本轮" % MAX_REPEAT_CALLS
+                result = ("错误: 等价的 %s 调用已连续出现 %d 次，已中止本轮，本次调用未执行。"
+                          "该文件/命令此前已执行过，请直接使用已有结果，或换一种思路。"
+                          % (name, repeat["n"]))
             else:
                 try:
                     func = TOOL_FUNCS.get(name)
@@ -1990,7 +1970,7 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="注意: --yes 的含义是「命令执行前需人工确认」。不加 --yes 时命令默认直接放行。\n"
                "显式传入的连接类参数（-m/--model、-b/--base-url、-k/--api-key、"
-               "-s/--max-steps、-t/--http-timeout、-d/--db）会加密记录到用户主目录的 .bo，"
+               "-s/--max-steps、-t/--http-timeout、-T/--tool、-d/--db）会加密记录到用户主目录的 .bo，"
                "之后不传参或只传部分参数时自动复用；删除 .bo 即恢复默认。"
                "优先级: 命令行 > 环境变量 > .bo > 内置默认。")
     parser.add_argument("-m", "--model", default=S,
@@ -2003,6 +1983,8 @@ def parse_args():
                         help="开启命令执行前的逐条人工确认（不加则命令默认直接放行）")
     parser.add_argument("-s", "--max-steps", type=int, default=S, help="单轮最多工具调用轮数")
     parser.add_argument("-t", "--http-timeout", type=int, default=S, help="单次 HTTP 请求超时秒数")
+    parser.add_argument("-T", "--tool", type=int, default=S, dest="tool_rounds", metavar="N",
+                        help="历史里保留最近 N 轮用户输入的完整工具往返（默认 %d）" % TRIM_KEEP_ROUNDS)
     parser.add_argument("-q", "--quiet", action="store_true",
                         help="只显示最终答复，隐藏全部工具/思考过程")
     parser.add_argument("-v", "--verbose", action="count", default=0,
@@ -2038,6 +2020,7 @@ def parse_args():
     api_key = pick("api_key", env("OPENAI_API_KEY") or None, "")
     max_steps = pick("max_steps", None, 50)
     http_timeout = pick("http_timeout", None, 120)
+    tool_rounds = max(_int(pick("tool_rounds", None, TRIM_KEEP_ROUNDS), TRIM_KEEP_ROUNDS, minimum=0), 0)
     db_path = pick("db_path", env("BO_DB") or None, DEFAULT_DB_FILE)
     db_path = os.path.expanduser(db_path)
 
@@ -2051,7 +2034,8 @@ def parse_args():
 
     # 只把本次显式传入的连接类参数写回 .bo，保留文件中其它键（键名同 CONFIG_KEYS）
     resolved = {"model": model, "base_url": base_url, "api_key": api_key,
-                "max_steps": max_steps, "http_timeout": http_timeout, "db_path": db_path}
+                "max_steps": max_steps, "http_timeout": http_timeout,
+                "tool_rounds": tool_rounds, "db_path": db_path}
     updates = {k: resolved[k] for k in CONFIG_KEYS if k in a_vars}
 
     config_saved, config_error = False, None
@@ -2088,6 +2072,7 @@ def parse_args():
         "model": model, "base_url": base_url, "api_key": api_key,
         "confirm": confirm,
         "max_steps": max_steps, "http_timeout": http_timeout, "cwd": os.getcwd(),
+        "tool_rounds": tool_rounds,
         "level": level, "color": color, "db_path": db_path,
         "config_status": cfg_status, "config_saved": config_saved, "config_error": config_error,
         "config_used": bool(used_cfg),
@@ -2113,11 +2098,31 @@ def setup_stdio():
 
 
 def _new_session(opts, out):
-    """关闭旧会话并开启新会话（进程启动与 /reset 共用）。"""
+    """标记「下一个真实回话属于新会话」；真正的库记录延迟到用户首次输入时创建。
+
+    启动或 /reset 时并不立刻建会话：只关闭上一个、把 session_id 置空。这样只启动
+    看看就 exit（或 /reset 后直接退出）不会在库里留下空会话；/s 列出的也只会有
+    真正聊过的会话。
+    """
     db_close_session(out.conn, out.session_id, "closed")
-    sid, _no = db_new_session(out.conn, opts)
-    out.session_id = sid
+    out.session_id = None
     out.step = 0
+
+
+def _ensure_session(opts, out, system_prompt=None):
+    """用第一个真实回话建立会话记录（延迟创建）；已是会话则直接返回。
+
+    建会话的同时补写 SESSION BEGIN 与 SYSTEM 两条起始事件——它们原本在进程启动时
+    就写，改成延迟创建后必须等会话真正建好才有地方落。
+    """
+    if out.session_id is None:
+        sid = db_new_session(out.conn, opts)
+        out.session_id = sid
+        out.log("SESSION BEGIN", "编号: %d\nmodel=%s\nbase_url=%s\ncwd=%s\nlevel=%s" % (
+            sid, opts["model"], opts["base_url"], opts["cwd"], opts["level"]))
+        if system_prompt:
+            out.log("SYSTEM", system_prompt)
+    return out.session_id
 
 
 def main():
@@ -2130,15 +2135,16 @@ def main():
         sys.stderr.write("无法使用会话数据库，已退出。\n")
         sys.exit(1)
     out = Output(opts["level"], opts["color"], conn, None)
-    _new_session(opts, out)
     system_prompt = build_system_prompt(opts)
+    # 不在这里建会话：只启动看看就退出（或 /reset 后直接退出）不会留下空会话，
+    # 真正的库记录延迟到用户首次输入时创建（见 run_turn -> _ensure_session）
 
     sys.stdout.write(
         "BO —— 最小编码智能体 (Python %s, %s)\n"
-        "模型: %s\n接口: %s\n命令确认: %s\n显示级别: %s\n会话: #%d\n"
+        "模型: %s\n接口: %s\n命令确认: %s\n显示级别: %s\n工具历史: 保留最近 %d 轮\n"
         % (platform.python_version(), platform.system(), opts["model"], opts["base_url"],
            "开启 (--yes)" if opts["confirm"] else "关闭 (默认放行)",
-           LEVEL_NAMES[opts["level"]], out.session_id))
+           LEVEL_NAMES[opts["level"]], opts["tool_rounds"]))
     sys.stdout.write("会话库: %s\n" % opts["db_path"])
     if opts["config_status"] == "invalid":
         sys.stderr.write("警告: %s 存在但无法解密/解析（或非本机生成），已忽略\n" % CONFIG_FILE)
@@ -2150,9 +2156,6 @@ def main():
         sys.stderr.write("警告: 写入 %s 失败: %s\n" % (CONFIG_FILE, opts["config_error"]))
     sys.stdout.write("输入 /help 查看帮助，exit 退出。\n")
 
-    out.log("SESSION BEGIN", "编号: %d\nmodel=%s\nbase_url=%s\ncwd=%s\nlevel=%s" % (
-        out.session_id, opts["model"], opts["base_url"], opts["cwd"], opts["level"]))
-    out.log("SYSTEM", system_prompt)
     messages = [{"role": "system", "content": system_prompt}]
     started = time.time()
 
@@ -2171,8 +2174,7 @@ def main():
             if user == "/reset":
                 _new_session(opts, out)
                 messages = [{"role": "system", "content": system_prompt}]
-                out.log("RESET", "对话历史已清空，已开新会话")
-                sys.stdout.write("已清空对话历史，开启新会话 #%d。\n" % out.session_id)
+                sys.stdout.write("已清空对话历史，下次输入将开启新会话。\n")
                 continue
             if user == "/s":
                 try:
@@ -2182,7 +2184,7 @@ def main():
                     sys.stdout.write("选择会话失败: %s\n" % e)
                     continue
                 if sid is not None:
-                    loaded = load_history(out.conn, sid, system_prompt)
+                    loaded = load_history(out.conn, sid, system_prompt, opts["tool_rounds"])
                     if loaded:
                         # 收尾当前会话，再切回被载入会话续写
                         prev = out.session_id
@@ -2228,8 +2230,10 @@ def main():
         # 兜底：在错误/中断的收尾处理中再按一次 Ctrl+C，避免直接抛 traceback
         sys.stdout.write("\n再见。\n")
     finally:
-        out.log("SESSION END", "编号: %d\n耗时: %.1fs" % (out.session_id, time.time() - started))
-        db_close_session(out.conn, out.session_id, "closed")
+        # 从未有过真实输入（session_id 仍为空）时不写任何事件，也不建空会话
+        if out.session_id is not None:
+            out.log("SESSION END", "编号: %d\n耗时: %.1fs" % (out.session_id, time.time() - started))
+            db_close_session(out.conn, out.session_id, "closed")
         try:
             out.conn.close()
         except Exception:

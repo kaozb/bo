@@ -10,7 +10,7 @@
 
 - 单文件、零依赖，Python 3.6+
 - 五个工具：`read_file` / `write_file`（新建/整体覆盖）/ `edit_file`（精确局部替换）/ `search` / `run_command`
-- 对话历史自动瘦身：每轮只保留最近一次工具调用与结果，更早的自动移除
+- 对话历史自动瘦身：只保留最近若干轮用户输入的完整工具往返，更早轮次的工具调用与结果自动移除（轮数用 `-T/--tool` 配置，默认 2）
 - Ctrl+C 第一次只中断当前一轮（生成中或命令执行中），再按一次退出程序；中断不打乱对话历史
 - 分级输出：`-q` / `-v` / `-vv`
 - 完整交互记录写入 SQLite 会话库（默认 `.ai.db`，0600，仅本人可读）；可用 `/s` 载入并继续历史会话
@@ -75,12 +75,13 @@ python3 bo_en.py -y -v -d ~/sessions/my.db -m deepseek-chat
 | `-y, --yes` | 命令执行前逐条人工确认（不加则直接放行） |
 | `-s, --max-steps N` | 单轮最多工具调用轮数，默认 50 |
 | `-t, --http-timeout N` | 单次请求超时秒数，默认 120 |
+| `-T, --tool N` | 历史里保留最近 N 轮用户输入的完整工具往返，默认 2（一轮 = 一次用户输入，轮内多步调用不会被拆开裁剪） |
 | `-q` / `-v` / `-vv` | 只显示最终答复 / 工具结果与思考 / 完整明细 |
 | `-C, --no-color` | 关闭彩色输出（默认仅在终端下着色） |
 | `-d, --db FILE` | 会话数据库文件（默认 `.ai.db`），完整交互记录写入此处；也可用环境变量 `BO_DB` 指定 |
 | `-l, --list-models` | 列出接口支持的模型，按编号选择后写入 `.bo` 并退出 |
 
-优先级：**命令行 > 环境变量 > `.bo` > 内置默认**。只有连接类参数（`-m`、`-b`、`-k`、`-s`、`-t`、`-d`）会加密写入用户主目录的 `.bo`（0600）并在下次复用；`-y`、`-q`/`-v`、`-C` 仅本次生效，不写入该文件。`.bo` 的密钥由所在目录路径派生，与目录绑定：换机器或换用户后无法解密，会被当作无效配置忽略；删除 `.bo` 即恢复默认。**文件可能含 API 密钥，请勿提交**。
+优先级：**命令行 > 环境变量 > `.bo` > 内置默认**。只有连接类参数（`-m`、`-b`、`-k`、`-s`、`-t`、`-T`、`-d`）会加密写入用户主目录的 `.bo`（0600）并在下次复用；`-y`、`-q`/`-v`、`-C` 仅本次生效，不写入该文件。`.bo` 的密钥由所在目录路径派生，与目录绑定：换机器或换用户后无法解密，会被当作无效配置忽略；删除 `.bo` 即恢复默认。**文件可能含 API 密钥，请勿提交**。
 
 ## 工具
 
@@ -96,8 +97,8 @@ python3 bo_en.py -y -v -d ~/sessions/my.db -m deepseek-chat
 
 | 命令 | 说明 |
 | :--- | :--- |
-| `/reset` | 清空对话历史，开启新会话 |
-| `/s` | 列出最近 10 个历史会话，选择其中一个载入并继续 |
+| `/reset` | 清空对话历史，下次输入时开启新会话 |
+| `/s` | 列出最近 10 个会话标题，选择其中一个载入并继续 |
 | `/help` | 显示帮助 |
 | `exit` | 退出（`quit` / `/exit` / `/quit` 亦可） |
 | `Ctrl+C` | 第一次只中断当前一轮（生成中或命令执行中）并回到提示符，再按一次退出程序；命令被中断时会连同派生进程一起清理 |
@@ -118,7 +119,7 @@ A single-file, standard-library-only minimal coding agent. Any machine running P
 
 - Single file, zero dependencies, Python 3.6+
 - Five tools: `read_file` / `write_file` (create/overwrite) / `edit_file` (exact partial replacement) / `search` / `run_command`
-- Automatic history slimming: each turn keeps only the most recent tool call and its result, earlier ones are dropped
+- Automatic history slimming: only the complete tool round-trips of the most recent rounds of user input are kept, tool calls and results from earlier rounds are dropped (set the round count with `-T/--tool`, default 2)
 - Ctrl+C interrupts the current turn on the first press (generation or running command) and quits on the second; an interrupt never corrupts the conversation history
 - Tiered output: `-q` / `-v` / `-vv`
 - The full interaction record is written to a SQLite session database (default `.ai.db`, 0600, owner-only); use `/s` to load and continue a past session
@@ -183,12 +184,13 @@ Every common option accepts both a short and a long form, e.g. `-b` is the same 
 | `-y, --yes` | ask for confirmation before each command (without it, commands run directly) |
 | `-s, --max-steps N` | max tool-call rounds per turn, default 50 |
 | `-t, --http-timeout N` | per-request timeout in seconds, default 120 |
+| `-T, --tool N` | keep the complete tool round-trips of the most recent N rounds of user input in the history, default 2 (one round = one user input; the multiple steps inside a round are never split apart by trimming) |
 | `-q` / `-v` / `-vv` | final answer only / tool results and thinking / full detail |
 | `-C, --no-color` | disable colored output (colors only on a terminal by default) |
 | `-d, --db FILE` | session database file (default `.ai.db`) holding the full interaction record; the `BO_DB` environment variable works too |
 | `-l, --list-models` | list the models the endpoint supports, pick one by number, write it to `.bo` and exit |
 
-Precedence: **command line > environment variable > `.bo` > built-in default**. Only connection options (`-m`, `-b`, `-k`, `-s`, `-t`, `-d`) are encrypted into `.bo` in your home directory (0600) and reused next time; `-y`, `-q`/`-v`, `-C` apply to the current run only and are not written there. The `.bo` key is derived from the directory path and bound to it: on another machine or as another user it cannot be decrypted and is ignored as invalid; delete `.bo` to reset. **The file may contain your API key, so do not commit it**.
+Precedence: **command line > environment variable > `.bo` > built-in default**. Only connection options (`-m`, `-b`, `-k`, `-s`, `-t`, `-T`, `-d`) are encrypted into `.bo` in your home directory (0600) and reused next time; `-y`, `-q`/`-v`, `-C` apply to the current run only and are not written there. The `.bo` key is derived from the directory path and bound to it: on another machine or as another user it cannot be decrypted and is ignored as invalid; delete `.bo` to reset. **The file may contain your API key, so do not commit it**.
 
 ## Tools
 
@@ -204,8 +206,8 @@ Precedence: **command line > environment variable > `.bo` > built-in default**. 
 
 | Command | Description |
 | :--- | :--- |
-| `/reset` | clear the conversation and start a new session |
-| `/s` | list the last 10 sessions and load one to continue |
+| `/reset` | clear the conversation; a new session starts with your next input |
+| `/s` | list the titles of the last 10 sessions and load one to continue |
 | `/help` | show help |
 | `exit` | quit (`quit` / `/exit` / `/quit` also work) |
 | `Ctrl+C` | the first press interrupts the current turn (generation or running command) and returns to the prompt, the second quits; an interrupted command is cleaned up together with its spawned processes |

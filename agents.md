@@ -87,19 +87,23 @@
 
 ## 项目概况
 
-BO 是单文件、纯标准库的最小编码智能体，走 OpenAI 兼容接口（`/v1/chat/completions`），4 个工具：
+BO 是单文件、纯标准库的最小编码智能体，走 OpenAI 兼容接口（`/v1/chat/completions`），5 个工具：
 
 - `read_file`   读文件（带行号、offset/limit 续读）/ 列目录
-- `write_file`  双模式：`content` 新建或整体覆盖；`old_string`+`new_string`（或 `edits`）精确替换。
-                **不拆成 write + edit 两个工具**；删除/移动交给 `run_command` 的 rm/mv，不加 delete_file/move_file
+- `write_file`  整体写入：`path` + `content`（新建或整体覆盖）。父目录自动创建，空 content 拒绝。
+- `edit_file`   局部修改：`path` + `old_string`/`new_string`（或 `edits` 批量）。三级降级定位。
 - `search`      正则搜索（整文件预筛 + 逐行匹配）
 - `run_command` shell 执行（PIPE + 采集线程，超时按进程组击杀）
 
-完整交互写入 **SQLite 会话库**（默认 `.ai.db`，`-d/--db` 或环境变量 `BO_DB` 指定；sqlite3 是标准库，
-不破坏零依赖）。交互命令：`/reset` 开新会话、`/s` 载入历史会话、`/help`、`exit`。
+`write_file` 与 `edit_file` **是两个独立工具**（曾合一，已拆分）。删除/移动交给 `run_command` 的
+rm/mv，不加 delete_file/move_file。
 
-启动参数：`-m/-b/-k/-s/-t/-d` 为连接类参数（写入 `.bo`），`-y/-q/-v/-C` 仅本次生效；
+完整交互写入 **SQLite 会话库**（默认 `.ai.db`，`-d/--db` 或环境变量 `BO_DB` 指定；sqlite3 是标准库，
+不破坏零依赖）。交互命令：`/reset` 清空并延迟开新会话、`/s` 载入历史会话、`/help`、`exit`。
+
+启动参数：`-m/-b/-k/-s/-t/-T/-d` 为连接类参数（写入 `.bo`），`-y/-q/-v/-C` 仅本次生效；
 `-l/--list-models` 拉取 `/models` 让用户按编号选模型，写入 `.bo` 后直接退出。
+**`-t` 是 `--http-timeout`；工具历史轮数是 `-T/--tool`（大写 T）。**
 
 文件构成：
 
@@ -108,88 +112,97 @@ BO 是单文件、纯标准库的最小编码智能体，走 OpenAI 兼容接口
 - `README.md`  中文为准，开头有 `[English]` 锚点
 - `tools/py36check.py` 3.6 兼容扫描；`tools/regress.py` 工具层回归 + 性能守卫
 - `.bo`         运行时加密参数记忆（0600，含 API 密钥），**已 gitignore**
-- `.ai.db`      会话库（含全部对话记录），**已 gitignore**（`git log --all` 从未提交）
+- `.ai.db`      会话库（含全部对话记录），**已 gitignore**
 - `agents.md`   本文件
 
 ## 工作流程约定（重要）
 
 1. **接到修正/修复任务只改 `bo.py`**，不要顺手改 `bo_en.py` 或 `README.md`。
 2. **只在提交前同步**：把 bo.py 的改动移植到 bo_en.py（保持结构与行序）；影响用法/参数/特性才更新
-   README——注意 README「特性」写明了工具个数（4 个，write_file 双模式），增删工具必须一起改。
-3. 提交信息用中文 `fix:`/`feat:` 前缀；提交前确认 `.bo`、`.ai.db`、`BO.log`、`__pycache__` 未被纳入。
+   README——README「特性」写明了工具个数（5 个），增删工具必须一起改。
+3. 提交信息用中文 `fix:`/`feat:` 前缀；提交前确认 `.bo`、`.ai.db`、`__pycache__` 未被纳入。
 4. 本仓库 git 身份通过 `git config --local` 设为 `mibo <aoamo95@gmail.com>`，勿用全局身份提交。
 
 ## 编码约束
 
 - 兼容 **Python 3.6+**：不用 3.7+ 专有 API（`subprocess.run(capture_output=/text=)`、`stream.reconfigure`、
   `:=`、dataclasses、`f"{x=}"`）；UTF-8 按 `setup_stdio`（getattr 探测 reconfigure + TextIOWrapper 兜底）。
-  改完跑 `python3 tools/py36check.py bo.py`。
+  改完跑 `python3 tools/py36check.py bo.py`——会报 `setup_stdio` 的 `.reconfigure` 一处，那是 `hasattr`
+  守卫下的 3.7+ 分支，**属工具误报，可忽略**。
 - **零第三方依赖**，只用标准库；保持单文件不拆模块（`tools/` 是开发工具，非运行时）。
 - 用户可见输出中文（bo.py）/ 英文（bo_en.py）两套，新增文案同时留位置。
 - 修改代码小步精确（old_string/new_string），不要整文件重写。
 - 优先 C 级原语而非 Python 逐元素循环：`str.find/replace/count/join`、`bytes.count`、`os.scandir`。
 - 刻意简化处（如忽略全局锁、O(n²)、启发式上限）用 `ponytail:` 注释标注上限与升级路径（当前未使用）。
+- **不写版本兼容代码**：明确不兼容旧 `.ai.db` / 旧 `.bo` 结构，也不需要为旧数据保留降级分支。
 
-## 会话数据库（勿回退为文件日志）
+## 会话数据库
 
-- `db_open` 建两表：`sessions`（session_no/started_at/ended_at/status running|closed|crashed、model/
+- `db_open` 建两表：`sessions`（id/started_at/ended_at/status running|closed|crashed、model/
   base_url/title/prompt_tokens/completion_tokens）与 `events`（session_id, seq, ts, step, kind, role,
   content, tool_call_id…，按 (session_id, seq) 索引）。打开时把残留 `running` 会话标 `crashed`；
   库打不开直接 `sys.exit(1)`。`BO_VERSION`（`1.1.0-db`）写入 sessions。
+- **会话延迟创建**：启动 / `/reset` 只 `_new_session` 关旧会话并把 `session_id` 置空，**不写库**；
+  用户首次真实回话时 `run_turn` → `_ensure_session` 才 `db_new_session` 并补写
+  `session_begin`/`system`。因此只启动看看就 exit 不会留空会话，`/s` 列表天然都是有内容的会话
+  （`db_list_sessions` 无需按 title 过滤）。`finally` 里 `session_id is None` 则完全不写事件；
+  `db_add_event` 对 `session_id is None` 直接 return（防 NULL 侧写）。
 - 事件 kinds：`session_begin/system/user/assistant/tool_call/tool_result/bad_tool_call/trim/reset/
   error/session_end`，全部经 `Output.log` 入库（`_LOG_MAP` 是 kind→入库参数表，新增 kind 必须登记，
   否则被静默丢弃）；`db_bump_tokens` 累计 usage 并把耗时写回最近一条 assistant 事件。
   **思考（reasoning）从不入库**，因此也不会被还原。
 - title = 首条 user 消息首行（≤60 字符），仅在 title 为空时写。
-- `/reset` → `_new_session`；`/s` → `choose_session` 列最近 10 条 → `db_load_session` 还原 →
-  `load_history` 走同一 `_trim_history` 并用 `_close_tool_calls` 补齐悬空 tool 结果。
+- `/reset` → `_new_session`（延迟建库）；`/s` → `choose_session` 列最近 10 条（**只显示标题**）→
+  `db_load_session` 还原 → `load_history` 走同一 `_trim_history` 并用 `_close_tool_calls` 补齐悬空结果。
 
 ## 工具层关键设计（改动时不要回退）
 
 - **search 整文件预筛**（`_search_prefilter`）：先对全文 `re.search`，不命中就跳过 `splitlines`+逐行匹配。
   pattern 含 `\A`/`\Z`/`(?-m` 时不用（整文件与逐行语义不同）；含 `$` 且正文含 `\r`（CRLF）时不用。
-- **write_file 精确 replace_all 走 `str.replace`**；容错路径按跨度 join 拼接，不反复切片。
+- **`write_file` 整体覆盖与 `edit_file` 局部替换是两个工具**，各自只接受对应参数并互相点名提示
+  （给错参数时提示改用另一个工具）。edit_file 的 `replace_all` 精确路径走 `str.replace`；
+  容错路径按跨度 join 拼接，不反复切片。
 - **`_candidates` 未命中路径用片段子串扫描**（`_probe_fragments`+`str.find`），不对每行跑
   `difflib.SequenceMatcher`。
-- **`_locate` 容错分支按行比对**（`_locate_fuzzy`），不逐字符建下标映射。
-- **`_locate_tolerant` 终级兜底**：精确与 `_locate_fuzzy` 都未命中时，单行 old_string 与文件某行仅差
-  「空白多少/tab/CRLF」→ 删全部空白后整行相等即定位（归一化后 <4 字符放弃，防误伤），提示
-  「已按整行匹配（忽略了空白差异）」。
+- **`_locate` 三级降级**：精确 → 忽略行尾空白/CRLF（`_locate_fuzzy`，按行比对）→ 整行归一化
+  （`_locate_tolerant`，单行 old 与文件某行仅差空白/tab/CRLF，删空白后整行相等即定位；归一化后
+  <4 字符放弃防误伤）。
 - **`_read_lines_window` 整读 + `_decode_bytes` 探测编码**（utf-8→gbk→latin-1）。没有流式扫描分支，
   因此不存在「小文件正常、大文件乱码」的双路径不一致。
 - **`MAX_READ_BYTES = 3MB`**：read_file 读取与 write_file 整体写入的上限，超限一律拒绝并提示改用
   `run_command` 配合 head/tail/sed；`MAX_READ_MB` 供提示文案复用。
 - **`_list_dir` 用 `os.scandir`**；**行切分统一走 `_split_lines`**（只按 `\n` 断行、去行尾 `\r`、
   忽略末尾空行），因此 `\x0b`/`\x0c`/`\x85`/`\u2028` 不当行分隔，行号与编辑器一致。
+- **超长行截断带原长**：`read_file` 与 `search` 的 `_truncate` note 为 `"... [本行已截断，原 %d 字符]"`。
 
 有意为之的行为（勿当 bug 改回）：
 
-- `_resolve` 只做空 path 检查与 `realpath` 规范化，**无路径越界限制**（`-r/--root` 已整项移除：
-  README/`-h`/`parse_args`/`CONFIG_KEYS` 都没有该参数，`.bo` 里遗留的 `root` 键被 `CONFIG_KEYS`
-  过滤掉。`run_command` 本就是 shell 执行、无法用 cwd 约束，移除后文件与命令均无路径限制）。
+- **无路径越界限制**：`-r/--root` 已整项移除（可执行文件本就 shell 执行、无法用 cwd 约束）；
+  `.bo` 里遗留的 `root` 键被 `CONFIG_KEYS` 过滤掉。
 - 行级容错定位不吞掉「被替换文本之后」的行尾空白与 `\r`。
 - 整体写入 GBK 文件时新内容无法用原编码表示则回退 utf-8 **并明说**（编辑模式仍报错、不写盘）。
-- `write_file` 只给 `replace_all`（缺 old_string）会点名提示该参数被忽略。
-- `write_file` 同时给 content 与 new_string/edits：按**局部替换**执行并忽略 content（成功时附提示）；
-  只给 content+old_string（无 new_string/edits）仍报错。
 
-已删除、勿重新引入：`_looks_binary`、`_norm_text`、`MAX_SEARCH_LINES`、`import codecs`、
-`import itertools`、`-l/--log` 与 `-L/--no-log` 及 `log_path`（由 `-d/--db` 与 db_path 取代）、
-`TRIM_KEEP_TURNS`（由 TRIM_KEEP_CALLS 取代）、`-r/--root`、BO.log 文件日志。
+## 历史瘦身
 
-## 历史瘦身（只动 bo.py）
-
-- `TRIM_KEEP_CALLS = 1` + `_trim_history(messages, keep_calls)`：批次 = 一条带 tool_calls 的 assistant
-  消息 + 其后对应的 role=tool 结果；只保留最近 keep_calls 个批次，更早的 tool 结果被移除、assistant
-  摘掉 tool_calls 字段（去掉后 content 为空则整条删）。system 与全部 user/assistant 正文保留。
-- 调用点两处：`run_turn` 开头（append 当前 user 消息前）与 `load_history`（/s 载入后走同一裁剪，
-  保证重载后形状与实时对话一致）。
+- `TRIM_KEEP_ROUNDS = 2`（`-T/--tool` 可配并写入 `.bo`）+ `_trim_history(messages, keep_rounds)`：
+  **以 user 消息为分割线分轮**，一轮 = 一条 user 及其后到下一个 user 前的全部 assistant/tool 消息；
+  只保留最近 keep_rounds 轮的**完整工具往返**，更早轮次的 tool 结果被移除、assistant 摘掉 tool_calls
+  字段（去掉后 content 为空则整条删）。system 与全部 user/assistant 正文保留。
+  **一轮内的多步调用属于同一轮，绝不因步数被裁**——裁剪发生在 `run_turn` 开头（append 当前 user 前），
+  不在 step 循环里。
+- 调用点两处：`run_turn` 开头与 `load_history`（/s 载入后走同一裁剪，保证重载后形状与实时对话一致）。
 - **`db_load_session` 按 `step` 合并 tool_call**：同一 step 的多条 tool_call 属于同一条 assistant
-  消息（模型一次并行调用），还原时并入一条带多个 tool_calls 的 assistant；否则每个 tool_call 各占一条，
-  会被 `_trim_history` 当成多个批次、同一步的调用被裁掉一部分。纯正文、无工具调用的 assistant 会去掉
-  空 `tool_calls` 列表，避免发出 `tool_calls: []` 被判非法。
+  消息（模型一次并行调用），还原时并入一条带多个 tool_calls 的 assistant；纯正文、无工具调用的
+  assistant 会去掉空 `tool_calls` 列表，避免发出 `tool_calls: []` 被判非法。
 - 丢掉纯工具往返后可能连续两条 user，`_trim_history` 会合并（`\n\n`）维持角色交替。
 - 裁剪静默，仅记一条 `trim` 事件。
+
+## 重复调用护栏
+
+- `MAX_REPEAT_CALLS = 3`：同一轮内**等价**的调用连续出现 3 次即中止本轮。
+- `_repeat_key(name, args)` 做归一化，**不比对 raw_args 字符串**（否则改个 offset/timeout 就绕过）：
+  文件类工具取「工具名 + realpath 路径」；`search` 取「pattern+path+glob」；`run_command` 取命令主体
+  （忽略 cwd/timeout）；其它回落参数 JSON 稳定序列化。参数非 dict 也不抛异常。
 
 ## 坏 tool_call 防护（勿回退为「先落盘后校验」）
 
@@ -198,26 +211,20 @@ BO 是单文件、纯标准库的最小编码智能体，走 OpenAI 兼容接口
 接口判 `HTTP 400 input_invalid`，用户除了 `/reset` 别无他法。
 
 - `_tool_args_error(raw)`：返回 None 表示可用；参数为空 / 非合法 JSON / 非 JSON 对象都算不可用。
-- `_parse_tool_calls(tool_calls)`：分成 (可用: [(调用, 已解析参数)], 不可用: [调用])。**缺函数名也算不可用**
-  （同样还原不出合法结构）。
+- `_parse_tool_calls(tool_calls)`：分成 (可用: [(调用, 已解析参数)], 不可用: [调用])。**缺函数名也算不可用**。
 - `run_turn`：只对可用的调用 `out.log("TOOL_CALL …")` 并 append；坏调用记一条 `bad_tool_call` 事件
   （保留原始非法参数便于排查）后丢弃，提示用户但不中断对话。若整批都不可用，本轮直接 return。
-- `_drop_tool_calls_by_id(messages, ids)`：兜底，按 id 精确摘除坏调用及其 `role=tool` 结果。
-  **必须就地修改（`m["tool_calls"] = keep`），不能替换为 `dict(m)` 副本**——调用方可能仍持有原消息引用。
-- `db_load_session` 载入时清理旧库中已存在的坏记录，老会话无需重建即可续用。
-- `Output.tool_call` 对 `name`/`raw_args` 做 `or "?"` / `or "{}"` 兜底（坏调用正是 name 可能为 None 的情形）。
+- `db_load_session` 直接按 `tool_call_id` 还原（落盘侧已保证非空），空 id 的调用/结果直接丢弃。
 
-## Ctrl+C 语义（只动 bo.py）
+## Ctrl+C 语义
 
 - `TurnInterrupted(BaseException)` + `_INTERRUPT = {"busy","seen"}` + `_handle_sigint` /
   `install_sigint_handler`：**一轮内第一次 Ctrl+C 只中断本轮，第二次（或空闲时一次）退出程序**。
   必须继承 BaseException，否则被 `call_llm` 里的 `except Exception` 吞掉。
 - `run_turn` 开头置 `busy=True, seen=False`，main 的 `finally` 复位，计数每轮独立。
-- 中断落点三处：`call_llm` 调用处（assistant 消息未入历史，直接 return）；工具循环 `execute_tool` 处
-  （复用 aborted/abort_note/abort_info，给未执行 tool_calls 补结果）；main 兜底 `except TurnInterrupted`
-  （用 `_close_dangling_tool_calls` 补 tool 结果，免得下一轮被判格式错误）。
-- 补悬空结果有两个函数，**行为不同勿合并**：`_close_dangling_tool_calls` 只补最近一批、追加到末尾
-  （中断兜底用）；`_close_tool_calls` 给每批就地补、插在对应 assistant 之后（/s 载入历史用）。
+- 中断落点三处：`call_llm` 调用处（assistant 消息未入历史，直接 return）；工具执行处（置 aborted，
+  给未执行 tool_calls 补结果）；main 兜底 `except TurnInterrupted`（用 `_close_tool_calls` 补 tool 结果，
+  免得下一轮被判格式错误）。
 - `tool_run_command` 的 `proc.wait` 捕 `(TurnInterrupted, KeyboardInterrupt)` 后 `_terminate_group(proc)`
   再 raise，中断长命令不留派生进程。`_atomic_write` 清理用 `except BaseException`（Ctrl+C 是
   BaseException，否则残留 `.bo-*.tmp`）。`_confirm` 只捕 EOFError，KeyboardInterrupt 交给 `_handle_sigint`。
@@ -225,8 +232,8 @@ BO 是单文件、纯标准库的最小编码智能体，走 OpenAI 兼容接口
 ## 双语同步与等价性
 
 - bo_en.py 由 bo.py 逐行生成（按行号做「中文行→英文行」映射），保持结构与行序不变。
-- 英文因语序需要补跨行拼接缺失的空格；成功文案前缀统一 `OK:`（对应中文 `已`，供
-  `tool_write_file` 判断是否追加提示）。
+- 英文因语序需要补跨行拼接缺失的空格；成功文案前缀统一 `OK:`（对应中文 `已`，供 `tool_write_file`
+  判断是否追加提示）。
 - 符号表 diff（应只剩 `LEVEL_NAMES` 一行差异）：
 
 ```bash
@@ -251,37 +258,34 @@ a,b=t('bo.py'),t('bo_en.py'); print(len(a),len(b),a==b)"
   `MAX_RESPONSE_BYTES` 限制；`HTTPError`/`URLError`/非 JSON/缺 `data`/空清单都转 `RuntimeError`（中文文案）。
 - `choose_model(opts)` 打印 `[n] id` 让用户输编号；回车/非数字/越界都只提示并返回 None。
 - `parse_args` 里的 `-l` 分支在**写完本次显式连接参数之后**执行，用 `dict(cfg)+updates+model` 落盘，
-  因此 `.bo` 里其它键（`max_steps`/`http_timeout`/`db_path`）不会被抹掉；未选择则原样退出，不写盘。
+  因此 `.bo` 里其它键不会被抹掉；未选择则原样退出，不写盘。
 
 ## 常用验证命令
 
 ```bash
 cd /root/bo
 python3 -m py_compile bo.py bo_en.py                    # 语法检查
-python3 tools/py36check.py bo.py bo_en.py tools/*.py    # 3.6 兼容扫描
+python3 tools/py36check.py bo.py bo_en.py tools/*.py    # 3.6 兼容扫描（1 处已知误报）
 python3 tools/regress.py                                # 工具层回归 + 性能守卫
 python3 bo.py -h                                        # 帮助/参数自检
 diff bo.py bo_en.py                                     # 确认仅文案差异
 git status --short                                      # 提交前检查
 ```
 
-**当前状态（2026-09-20）**：py_compile ✅、py36check ✅（无 SyntaxWarning）。`regress.py` 有 **2 项失败
-属断言过时**，其余全过——两处失败的实际行为都是正确的（见待办）。3MB 上限、去 `--root`、`/s` 形状修复、
-Ctrl+C（含进程组击杀、无孤儿进程）均已实测通过。
+**当前状态（2026-09-21）**：`py_compile` 通过；`tools/regress.py` **全部通过**（exit 0，无 SyntaxWarning）。
+regress 已按 `write_file`/`edit_file` 拆分更新：整体写入用例归 `test_write_file`，局部替换用例归
+`test_edit_file`，并补了两者互相点名提示的用例。文件层行为已实测正确（含 3MB 上限、延迟建会话、
+`/s` 只列标题、历史按轮裁剪、重复护栏归一化）。
 
 ## 待办与环境
 
-- **tools/regress.py 有 2 项过时断言待更新**（替换本身都成功，只是文案变了）：
-  - 第 116 行 `"已忽略行尾空白"` → 应改认 `"已按整行匹配"`；
-  - 第 133 行 `"不能同时使用"` → 应改为断言「已修改 + 提示忽略 content」。
-- Python 3.6 真机（Docker）复测本批改动：sqlite3 是标准库、3.6 理论可用，但**尚未实测**。
+- Python 3.6 真机（Docker）复测尚未做；sqlite3 是标准库，理论可用。
 - 开发机 Linux armv7l，Python 3.12.3（代码向下兼容 3.6）；日常用 py36check.py 快检。
 - **测 `.bo` 相关功能务必先 `export HOME=<临时目录>`**：`CONFIG_FILE` 是 `~/.bo`，直接跑会覆盖
-  用户真实配置（曾用假接口 `-b 127.0.0.1` 覆盖过一次，真实 key/base_url/model 已从运行中的
-  `/usr/sbin/ai` 进程内存里捞回：`base_url=https://tokendance.space/gateway/v1`、`model=deepseek-v4.1-flash`）。
-  另：`save_config` 落盘键名与大小写敏感，恢复时用 `bo.save_config(dict, path)` 而非手拼字节。
-- 运行参数记忆优先级：命令行 > 环境变量（含 `BO_DB`）> `.bo` > 内置默认。只有连接类参数
-  （`-m`/`-b`/`-k`/`-s`/`-t`/`-d`）写入 `.bo`；`-y`/`-q`/`-v`/`-C` 仅本次生效。
+  用户真实配置（曾用假接口 `-b 127.0.0.1` 覆盖过一次）。恢复时用 `bo.save_config(dict, path)`
+  而非手拼字节（落盘键名大小写敏感）。
+- 参数记忆优先级：命令行 > 环境变量（含 `BO_DB`）> `.bo` > 内置默认。只有连接类参数
+  （`-m`/`-b`/`-k`/`-s`/`-t`/`-T`/`-d`）写入 `.bo`；`-y`/`-q`/`-v`/`-C` 仅本次生效。
 - `.bo` 密钥由所在目录路径派生，与目录绑定：换机器/换用户无法解密，被当作无效配置忽略。
 
 ### 3.6 Docker 复测命令（需要时用）
@@ -293,3 +297,4 @@ docker run --rm --network host -v /root/bo:/root/bo -w /root/bo python:3.6-slim 
 
 注意：容器里跑会**改写 `.bo`**，先 `cp .bo /tmp/bo.conf.bak`，验证后还原。没有真实 key 时可用标准库
 `http.server` + SSE 起假接口走通全流程（脚本不入库）。
+

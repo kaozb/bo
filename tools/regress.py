@@ -2,6 +2,8 @@
 # -*- coding: utf-8 -*-
 """BO 工具层回归：直接调用工具函数，不访问模型接口。
 
+覆盖 read_file / write_file / edit_file / search 与性能守卫。
+
 用法:
     cd <项目根目录> && python3 tools/regress.py
 
@@ -18,7 +20,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import bo  # noqa: E402
 
-OPTS = {"root": None, "cwd": os.getcwd(), "confirm": False}
+OPTS = {"cwd": os.getcwd(), "confirm": False}
 FAILS = []
 
 
@@ -88,7 +90,7 @@ def test_read_file(d):
 
 
 # --------------------------------------------------------------------------
-# write_file
+# write_file（整体写入）
 # --------------------------------------------------------------------------
 
 def test_write_file(d):
@@ -100,48 +102,75 @@ def test_write_file(d):
     out = bo.tool_write_file({"path": f, "content": "import os\nprint(1)\n"}, OPTS)
     check("整体覆盖", "已覆盖" in out and open(f).read().endswith("print(1)\n"), out)
 
-    out = bo.tool_write_file({"path": f, "old_string": "print(1)", "new_string": "print(2)"}, OPTS)
+    check("空 content 拒绝",
+          "content 为空" in bo.tool_write_file({"path": f, "content": ""}, OPTS))
+
+    # write_file 只做整体写入：带 old_string/new_string/edits 时点名提示改用 edit_file
+    out = bo.tool_write_file({"path": f, "old_string": "a", "new_string": "b"}, OPTS)
+    check("带 old_string 时提示改用 edit_file", "改用 edit_file" in out, out)
+    out = bo.tool_write_file({"path": f, "content": "z", "old_string": "a", "new_string": "b"}, OPTS)
+    check("content 与 old_string 同给时仍提示改用 edit_file", "改用 edit_file" in out, out)
+    # 参数冲突检查先于「空 content」检查：同时给出时点名提示改用 edit_file
+    out = bo.tool_write_file({"path": f, "content": "", "old_string": "a", "new_string": "b"}, OPTS)
+    check("参数冲突提示优先于空 content", "改用 edit_file" in out, out)
+
+    gbk = os.path.join(d, "w", "g.txt")
+    w(gbk, "第一行 GBK 内容\n".encode("gbk"))
+    out = bo.tool_write_file({"path": gbk, "content": "第一行\n第二行 emoji \U0001f642\n"}, OPTS)
+    check("编码回退有提示", "已改用 utf-8" in out, out)
+
+
+# --------------------------------------------------------------------------
+# edit_file（局部修改）
+# --------------------------------------------------------------------------
+
+def test_edit_file(d):
+    sys.stdout.write("edit_file\n")
+    f = os.path.join(d, "e", "a.py")
+    w(f, "import os\nprint(1)\n")
+
+    out = bo.tool_edit_file({"path": f, "old_string": "print(1)", "new_string": "print(2)"}, OPTS)
     check("精确替换", "共替换 1 处" in out and "print(2)" in open(f).read(), out)
 
-    out = bo.tool_write_file({"path": f, "old_string": "print(2)", "new_string": "X"}, OPTS)
-    check("唯一命中时报日期", "共替换 1 处" in out, out)
-    out = bo.tool_write_file({"path": f, "old_string": "o", "new_string": "0"}, OPTS)
+    out = bo.tool_edit_file({"path": f, "old_string": "print(2)", "new_string": "X"}, OPTS)
+    check("唯一命中时报处数", "共替换 1 处" in out, out)
+
+    out = bo.tool_edit_file({"path": f, "old_string": "o", "new_string": "0"}, OPTS)
     check("不唯一报错并给候选", "不唯一" in out and "候选位置" in out, out)
 
-    out = bo.tool_write_file({"path": f, "old_string": "o", "new_string": "0", "replace_all": True}, OPTS)
+    out = bo.tool_edit_file({"path": f, "old_string": "o", "new_string": "0", "replace_all": True}, OPTS)
     check("replace_all", "共替换" in out and "不唯一" not in out, out)
 
     w(f, "def f(a):   \n    return a  \n")
-    out = bo.tool_write_file({"path": f, "old_string": "def f(a):\n    return a", "new_string": "def g(a):\n    return a"}, OPTS)
-    check("容错替换(行尾空白)", "已忽略行尾空白" in out and "def g(a):" in open(f).read(), out)
+    out = bo.tool_edit_file(
+        {"path": f, "old_string": "def f(a):\n    return a", "new_string": "def g(a):\n    return a"}, OPTS)
+    check("容错替换(行尾空白)", "已按整行匹配" in out and "def g(a):" in open(f).read(), out)
 
     w(f, "alpha\nbeta\ngamma\n")
-    out = bo.tool_write_file({"path": f, "edits": [
+    out = bo.tool_edit_file({"path": f, "edits": [
         {"old_string": "alpha", "new_string": "A"},
         {"old_string": "gamma", "new_string": "G"}]}, OPTS)
     body = open(f).read()
     check("edits 两条", "共替换 2 处" in out and body == "A\nbeta\nG\n", out)
 
     before = open(f).read()
-    out = bo.tool_write_file({"path": f, "edits": [
+    out = bo.tool_edit_file({"path": f, "edits": [
         {"old_string": "beta", "new_string": "B"},
         {"old_string": "不存在的内容", "new_string": "y"}]}, OPTS)
     check("edits 失败整单不写入", "本次未做任何写入" in out and open(f).read() == before, out)
 
-    check("空 content 拒绝", "content 为空" in bo.tool_write_file({"path": f, "content": ""}, OPTS))
-    out = bo.tool_write_file({"path": f, "content": "z", "old_string": "a", "new_string": "b"}, OPTS)
-    check("content 与替换互斥", "不能同时使用" in out, out)
-    out = bo.tool_write_file({"path": f, "replace_all": True}, OPTS)
-    check("只给 replace_all 时点名提示", "replace_all" in out and "未生效" in out, out)
-    out = bo.tool_write_file({"path": os.path.join(d, "nope.py"), "old_string": "a", "new_string": "b"}, OPTS)
-    check("替换不存在的文件", "文件不存在" in out, out)
+    # edit_file 只做局部修改：带 content 时点名提示改用 write_file
+    out = bo.tool_edit_file({"path": f, "content": "z"}, OPTS)
+    check("带 content 时提示改用 write_file", "改用 write_file" in out, out)
+    out = bo.tool_edit_file({"path": f, "replace_all": True}, OPTS)
+    check("缺 old_string/new_string 时提示", "old_string" in out and "edits" in out, out)
 
-    gbk = os.path.join(d, "w", "g.txt")
+    out = bo.tool_edit_file({"path": os.path.join(d, "e", "nope.py"), "old_string": "a", "new_string": "b"}, OPTS)
+    check("编辑不存在的文件", "文件不存在" in out, out)
+
+    gbk = os.path.join(d, "e", "g.txt")
     w(gbk, "第一行 GBK 内容\n".encode("gbk"))
-    out = bo.tool_write_file({"path": gbk, "content": "第一行\n第二行 emoji \U0001f642\n"}, OPTS)
-    check("编码回退有提示", "已改用 utf-8" in out, out)
-    w(gbk, "第一行 GBK 内容\n".encode("gbk"))
-    out = bo.tool_write_file({"path": gbk, "old_string": "第一行", "new_string": "第一行\U0001f642"}, OPTS)
+    out = bo.tool_edit_file({"path": gbk, "old_string": "第一行", "new_string": "第一行\U0001f642"}, OPTS)
     check("编辑模式编码不符时报错", "无法用原编码" in out, out)
     check("出错后文件未被破坏", "第一行 GBK 内容" in open(gbk, "rb").read().decode("gbk"))
 
@@ -177,7 +206,7 @@ def test_search(d):
     sys.stdout.write("search\n")
     s = os.path.join(d, "s")
     w(os.path.join(s, "a.py"), b"import os\nx = 1\nqq a\n")
-    w(os.path.join(s, "b.py"), b"alpha\ndef foo\naa\Ztail\n")
+    w(os.path.join(s, "b.py"), b"alpha\ndef foo\naa\\Ztail\n")
     w(os.path.join(s, "crlf.txt"), b"z\r\nx\r\nimport os\r\n")
     w(os.path.join(s, "gbk.txt"), "中文\nimport os\n".encode("gbk"))
     w(os.path.join(s, "sub", "c.py"), b"import sys\n")
@@ -248,6 +277,7 @@ def main():
     try:
         test_read_file(d)
         test_write_file(d)
+        test_edit_file(d)
         test_search(d)
         test_perf(d)
     finally:

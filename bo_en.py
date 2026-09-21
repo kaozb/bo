@@ -19,14 +19,17 @@ Arguments:
     -y, --yes           require manual confirmation for each command before it runs (without it, commands run by default)
     -s, --max-steps N   max number of tool call rounds per turn (default 50)
     -t, --http-timeout N  timeout in seconds for a single request (default 120)
+    -T, --tool N        keep the complete tool round-trips of the most recent N user-input rounds in the history (default 2)
     -q                  show only the final answer, hide all tool/thinking output
     -v / -vv            show tool results and thinking / full detail
     -C, --no-color      disable colored output
     -d, --db FILE       session database (default .ai.db), the full interaction record is written here
 
-Argument memory: connection-type arguments passed explicitly (-m / -b / -k / -s / -t / -d) are encrypted and recorded in .bo in the user's home directory,
+Argument memory: connection-type arguments passed explicitly (-m / -b / -k / -s / -t / -T / -d) are encrypted and recorded in .bo in the user's home directory,
           and are reused automatically later when no arguments or only some arguments are passed; interactive and display switches such as -y / -q / -v / -C take effect for this run only and are
           not written to that file. Priority: command line > environment variables > .bo > built-in defaults; deleting .bo restores the defaults.
+
+Definition of a round: one active input from the user counts as one round, and a round may contain many tool calls; --tool controls how many recent rounds are kept.
 
 Interaction: /reset clears and starts a new session, /s loads a past session, /help shows help, exit quits
 """
@@ -68,15 +71,16 @@ MAX_EDITS = 50                       # max entries in the edit_file edits array 
 MAX_COMMAND_TIMEOUT = 3600           # run_command timeout limit (seconds)
 MAX_COMMAND_OUTPUT_BYTES = 256 * 1024  # max output run_command keeps in memory (half at each end, then truncated to the visible length)
 MAX_DIR_ITEMS = 1000                 # max items displayed at once when read_file lists a directory
-MAX_REPEAT_CALLS = 3                 # number of consecutive identical tool calls in one turn that aborts the turn
-TRIM_KEEP_CALLS = 1                  # keep only the most recent few tool calls (with their results) in the history, remove earlier ones
+MAX_REPEAT_CALLS = 3                 # number of consecutive equivalent tool calls in one turn that aborts the turn
+TRIM_KEEP_ROUNDS = 2                 # keep the complete tool round-trips of the most recent rounds of user input in the history, remove earlier ones
 SEARCH_SKIP_DIRS = (".git", "__pycache__", "node_modules", ".venv", "venv",
                     ".tox", ".mypy_cache", ".pytest_cache")  # directories skipped by search
 AGENT_FILE = "AGENTS.md"             # convention file in the current directory (case-insensitive); when present the model is told to read it
 CONFIG_FILE = os.path.join(os.path.expanduser("~"), ".bo")
 # Argument memory file in the user's home directory (encrypted), shared globally: written when arguments are passed explicitly, reused when none are
 # Only these "connection/run-type" arguments are written to .bo; interactive and display switches (-y / -q / -v / -C) take effect for this run only
-CONFIG_KEYS = ("model", "base_url", "api_key", "max_steps", "http_timeout", "db_path")
+CONFIG_KEYS = ("model", "base_url", "api_key", "max_steps", "http_timeout",
+               "tool_rounds", "db_path")
 DEFAULT_DB_FILE = ".ai.db"              # default session database file name (in the startup directory); can be set and remembered with -d/--db
 BO_VERSION = "1.1.0-db"                 # version identifier written into the session database
 
@@ -1316,7 +1320,6 @@ def db_open(path):
     conn.executescript(
         "CREATE TABLE IF NOT EXISTS sessions("
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
-        " session_no INTEGER,"
         " started_at REAL, ended_at REAL, status TEXT,"
         " model TEXT, base_url TEXT, cwd TEXT, host TEXT, pid INTEGER, bo_version TEXT,"
         " prompt_tokens INTEGER DEFAULT 0, completion_tokens INTEGER DEFAULT 0,"
@@ -1336,16 +1339,15 @@ def db_open(path):
 
 
 def db_new_session(conn, opts):
-    """Insert a running session, returning (session_id, session_no)."""
+    """Insert a running session, returning the session_id."""
     cur = conn.execute(
-        "INSERT INTO sessions(session_no, started_at, ended_at, status, model, base_url,"
-        " cwd, host, pid, bo_version) VALUES(NULL, ?, 0, 'running', ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO sessions(started_at, ended_at, status, model, base_url,"
+        " cwd, host, pid, bo_version) VALUES(?, 0, 'running', ?, ?, ?, ?, ?, ?)",
         (time.time(), opts["model"], opts["base_url"], opts["cwd"],
          platform.node(), os.getpid(), BO_VERSION))
     sid = cur.lastrowid
-    conn.execute("UPDATE sessions SET session_no=? WHERE id=?", (sid, sid))
     conn.commit()
-    return sid, sid
+    return sid
 
 
 def db_close_session(conn, sid, status):
@@ -1361,7 +1363,7 @@ def db_add_event(conn, session_id, step, kind, content="", role=None,
                  tool_name=None, tool_call_id=None, tool_args=None, is_error=0,
                  latency_ms=None, tokens_prompt=None, tokens_completion=None):
     """Append an event to the given session, with an auto-incrementing seq."""
-    if conn is None:
+    if conn is None or session_id is None:
         return
     row = conn.execute("SELECT COALESCE(MAX(seq), 0) FROM events WHERE session_id=?",
                        (session_id,)).fetchone()
@@ -1397,10 +1399,13 @@ def db_bump_tokens(conn, session_id, usage, latency_ms):
 
 
 def db_list_sessions(conn, limit=10):
-    """List the most recent sessions, for /s to choose from. Returns a list of rows."""
+    """List the most recent sessions, for /s to choose from. Returns a list of (id, title) rows.
+
+    Sessions are created lazily (see _ensure_session): nothing is written until a real conversation
+    happens, so the list naturally contains only sessions with content and no filtering by title is needed.
+    """
     return conn.execute(
-        "SELECT id, session_no, title, started_at, status FROM sessions "
-        "ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        "SELECT id, title FROM sessions ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
 
 
 def db_load_session(conn, sid, system_prompt=None):
@@ -1413,17 +1418,14 @@ def db_load_session(conn, sid, system_prompt=None):
 
     Multiple tool_calls in the same step belong to the same assistant message (the model calling in parallel at once),
     so they are merged here by step into one assistant message with several tool_calls, making the restored history shape
-    consistent with a live conversation —— otherwise, after loading with /s, each tool_call would occupy its own assistant message and be treated as
-    several batches by _trim_history, trimming away part of the calls from the same step.
+    consistent with a live conversation —— otherwise, after loading with /s, each tool_call would occupy its own assistant message,
+    leaving a shape that does not match a live conversation.
 
-    Old version databases did not store tool_call_id (all NULL), and restoring directly would emit tool_calls with id null,
-    rejected by the API as HTTP 400 "tool_calls.id and tool_calls.type are required". Here the missing
-    ids are synthesized and paired up: if an id exists it is reused, if missing a placeholder id is generated (hist_ prefix), and tool_result is backfilled
-    by id first, then by "earliest unmatched" order, guaranteeing every tool_call has a result and they correspond one to one;
-    orphan tool_results with no matching tool_call are dropped outright, to avoid an illegal message order.
+    tool_call_id is guaranteed non-empty on the persisting side (_parse_tool_calls only lets executable calls through), so it is
+    restored directly by id here; the occasional empty id, or a tool_result that does not match, means the data is corrupt
+    and the entry is dropped outright, so that tool_calls with id null are never emitted and rejected by the API as HTTP 400.
     """
     messages = []
-    pending = []          # tool_call ids already restored but without a result yet (FIFO, paired in order of appearance)
     group_step = None     # the step currently being aggregated
     group_msg = None      # the assistant message of the current step (including tool_calls)
     rows = conn.execute(
@@ -1448,45 +1450,28 @@ def db_load_session(conn, sid, system_prompt=None):
                          "tool_calls": []}
             messages.append(group_msg)
         elif kind == "tool_call":
-            call_id = tid or ("hist_%d_%d" % (sid, len(messages)))
-            pending.append(call_id)
+            if not tid:
+                continue                   # a call with no id cannot be paired with a result, drop it
             if group_msg is not None:
                 # subsequent calls of the same step are merged into the same assistant message
                 group_msg["tool_calls"].append(
-                    {"id": call_id, "type": "function",
+                    {"id": tid, "type": "function",
                      "function": {"name": name or "", "arguments": args or "{}"}})
             else:
                 group_msg = {"role": "assistant", "content": "",
-                             "tool_calls": [{"id": call_id, "type": "function",
+                             "tool_calls": [{"id": tid, "type": "function",
                                              "function": {"name": name or "",
                                                           "arguments": args or "{}"}}]}
                 messages.append(group_msg)
         elif kind == "tool_result":
-            if tid and tid in pending:
-                pending.remove(tid)
-                call_id = tid
-            elif pending:
-                call_id = pending.pop(0)   # id missing/not matching: pair in order with the earliest unmatched call
-            else:
-                continue                   # no corresponding tool_call, drop it to avoid an illegal message order
-            messages.append({"role": "tool", "tool_call_id": call_id, "content": content or ""})
+            if not tid:
+                continue                   # a result with no corresponding tool_call, drop it
+            messages.append({"role": "tool", "tool_call_id": tid, "content": content or ""})
     # assistant messages with only content and no tool calls: drop the empty tool_calls list (keeping it would emit
     # tool_calls: [], which some APIs treat as an illegal field)
     for m in messages:
         if not m.get("tool_calls"):
             m.pop("tool_calls", None)
-    # Older versions did not validate arguments when persisting, so the database may hold a tool_call with illegal/truncated
-    # arguments (e.g. a truncated output of just "{"). Restoring such a call means HTTP 400 for every request —— strip it at
-    # load time so old sessions remain usable (compare: on the persisting side, _parse_tool_calls stops new broken records
-    # from being created).
-    bad_ids = set()
-    for m in messages:
-        for tc in m.get("tool_calls") or []:
-            fn = (tc.get("function") or {}) if isinstance(tc, dict) else {}
-            if not fn.get("name") or _tool_args_error(fn.get("arguments")):
-                bad_ids.add(tc.get("id"))
-    if bad_ids:
-        _drop_tool_calls_by_id(messages, bad_ids)
     if system_prompt is not None:
         messages.insert(0, {"role": "system", "content": system_prompt})
     return messages
@@ -1512,14 +1497,13 @@ def _pick(items, prompt):
 
 
 def choose_session(conn):
-    """Interactively list recent sessions and let the user choose. Returns the selected session_id or None."""
+    """Interactively list recent sessions and let the user choose. Shows titles only; returns the selected session_id or None."""
     rows = db_list_sessions(conn, 10)
     if not rows:
         sys.stdout.write("no past sessions yet.\n")
         return None
-    items = ["%s  %s  (%s)" % ((title or "(untitled)")[:40],
-             time.strftime("%Y-%m-%d %H:%M", time.localtime(started or 0)), status)
-             for _sid, _no, title, started, status in rows]
+    items = [(title or "(untitled)").strip().replace("\n", " ")[:60]
+             for _sid, title in rows]
     idx = _pick(items, "which session to load? enter a number (Enter to cancel) > ")
     return rows[idx][0] if idx is not None else None
 
@@ -1681,36 +1665,35 @@ def build_system_prompt(opts):
 # Main conversation loop
 # ---------------------------------------------------------------------------
 
-def _trim_history(messages, keep_calls=TRIM_KEEP_CALLS):
-    """Remove earlier tool calls and results, keeping only the most recent keep_calls batches of calls.
+def _trim_history(messages, keep_rounds=TRIM_KEEP_ROUNDS):
+    """Trim the history by "rounds of user input": keep only the complete tool round-trips of the most recent keep_rounds rounds.
 
-    One batch = an assistant message with tool_calls + the corresponding role=tool results after it.
-    What is removed is the tool result messages of earlier batches, and the tool_calls field of assistant messages
-    (the whole message is deleted if its content is empty after removal); system and all user/assistant content are kept,
-    so the main thread of the conversation stays complete and only old tool round-trips are cleared. Thinking (reasoning) never enters messages,
-    so it is naturally neither restored nor trimmed. Returns the number of messages removed.
+    One round = one user message plus every assistant/tool message after it up to the next user message;
+    the multiple tool calls (steps) inside one round all belong to that round and are never trimmed because of their step count.
+    What is removed is the tool round-trips of earlier rounds: tool result messages and the tool_calls field of assistant
+    messages (the whole message is deleted if its content is empty after removal); system, all user messages and all assistant
+    content are kept, so the main thread of the conversation stays complete and only the tool round-trips of old rounds are cleared.
+    Thinking (reasoning) never enters messages, so it is naturally neither restored nor trimmed.
+    Returns the number of messages removed.
     """
-    batches = []          # (assistant index, list of result indexes)
-    cur = None
-    for i, m in enumerate(messages):
-        role = m.get("role")
-        if role == "assistant":
-            cur = (i, [])
-            batches.append(cur)
-        elif role == "tool" and cur is not None:
-            cur[1].append(i)
-    calls = [b for b in batches if messages[b[0]].get("tool_calls")]
-    if len(calls) <= keep_calls:
+    # find the index of every user message and cut the messages into "rounds" by it
+    user_idx = [i for i, m in enumerate(messages) if m.get("role") == "user"]
+    if len(user_idx) <= keep_rounds:
         return 0
+    keep_from = user_idx[len(user_idx) - keep_rounds]   # start of the most recent keep_rounds rounds
 
+    # remove the tool round-trips of earlier rounds: tool results and assistant.tool_calls; the recent rounds are untouched
     drop = set()
-    for ai, results in calls[:len(calls) - keep_calls]:
-        drop.update(results)
-        m = {k: v for k, v in messages[ai].items() if k != "tool_calls"}
-        if (m.get("content") or "").strip():
-            messages[ai] = m      # has content, only the tool_calls is stripped
-        else:
-            drop.add(ai)          # an assistant message with tool calls only and no content is dropped entirely
+    for i, m in enumerate(messages[:keep_from]):
+        role = m.get("role")
+        if role == "tool":
+            drop.add(i)
+        elif role == "assistant" and m.get("tool_calls"):
+            m = {k: v for k, v in m.items() if k != "tool_calls"}
+            if (m.get("content") or "").strip():
+                messages[i] = m    # has content, only the tool_calls is stripped
+            else:
+                drop.add(i)        # an assistant message with tool calls only and no content is dropped entirely
     if not drop:
         return 0
     merged = []
@@ -1725,6 +1708,31 @@ def _trim_history(messages, keep_calls=TRIM_KEEP_CALLS):
     dropped = len(messages) - len(merged)
     messages[:] = merged
     return dropped
+
+
+def _repeat_key(name, args):
+    """Normalize one tool call into an "equivalence check" key, for the repeated-call guard.
+
+    Comparing the raw_args string directly is too fragile: moving read_file's offset by one or changing run_command's
+    timeout would be treated as a "new call", and the same file/same command would actually run over and over. Here only
+    the "substantive arguments" are taken, by the semantics of each tool:
+      - file tools (read_file / write_file / edit_file): tool name + the normalized path;
+      - search: tool name + pattern + path + glob;
+      - run_command: tool name + the command body (cwd / timeout ignored);
+      - anything else: falls back to a stable serialization of the argument JSON.
+    A non-dict argument also falls back to JSON, guaranteeing no exception is raised.
+    """
+    if not isinstance(args, dict):
+        return "%s|%s" % (name, _brief(args, 200))
+    if name in ("read_file", "write_file", "edit_file"):
+        path = args.get("path") or ""
+        return "%s|%s" % (name, os.path.realpath(path) if path else "")
+    if name == "search":
+        return "%s|%s|%s|%s" % (name, args.get("pattern") or "",
+                                args.get("path") or ".", args.get("glob") or "*")
+    if name == "run_command":
+        return "%s|%s" % (name, (args.get("command") or "").strip())
+    return "%s|%s" % (name, json.dumps(args, sort_keys=True, ensure_ascii=False))
 
 
 def _tool_args_error(raw):
@@ -1769,42 +1777,11 @@ def _parse_tool_calls(tool_calls):
     return ok, bad
 
 
-def _drop_tool_calls_by_id(messages, ids):
-    """Strip the tool_calls with the given ids (and their results) in place.
-
-    Fallback: guarantees that neither the tool_calls sent to the API nor those written to the database contain illegal arguments.
-    Normally _parse_tool_calls already rejects broken calls before persisting; this is used to clean up old records left in the history.
-    The granularity is a single call: if an assistant message still has other calls, only the broken ones are deleted, and the whole
-    message is removed only when all that remains is broken calls (and there is no content); the accompanying role=tool results are
-    cleared as well, to avoid leaving orphan results with no corresponding call.
-    """
-    want = set(i for i in ids if i)
-    if not want:
-        return
-    out = []
-    for m in messages:
-        role = m.get("role")
-        if role == "tool" and m.get("tool_call_id") in want:
-            continue                              # the result of the broken call is removed as well
-        if role == "assistant" and m.get("tool_calls"):
-            keep = [tc for tc in m["tool_calls"] if tc.get("id") not in want]
-            if len(keep) != len(m["tool_calls"]):
-                # must be modified in place (not replaced by a dict copy): the caller may still hold a reference to this message
-                if keep:
-                    m["tool_calls"] = keep
-                elif (m.get("content") or "").strip():
-                    m.pop("tool_calls", None)     # has content, only the tool_calls is stripped
-                else:
-                    continue                      # broken calls only and no content, drop the whole message
-        out.append(m)
-    messages[:] = out
-
-
 def _close_tool_calls(messages):
     """Add a result in place for every tool_calls missing one, keeping the message history legal. Returns how many were added.
 
     Dangling results are inserted right after the corresponding assistant message (rather than appended to the end as a whole),
-    to avoid scrambling the message order. Later batches in the trimmed history are unaffected.
+    to avoid scrambling the message order. The rounds kept in the trimmed history are unaffected.
     """
     answered = set(m.get("tool_call_id") for m in messages if m.get("role") == "tool")
     fixed = 0
@@ -1823,16 +1800,16 @@ def _close_tool_calls(messages):
     return fixed
 
 
-def load_history(conn, sid, system_prompt):
-    """Restore a session from the database and slim it down: like a normal conversation, keep only the most recent tool call.
+def load_history(conn, sid, system_prompt, keep_rounds=TRIM_KEEP_ROUNDS):
+    """Restore a session from the database and slim it down: like a normal conversation, keep only the complete tool round-trips of the most recent rounds.
 
     Loading with /s and the trimming inside run_turn go through the same _trim_history, guaranteeing that after reloading the history the
     shape sent to the model matches a live conversation; thinking is never stored, so it is not restored either.
     """
     messages = db_load_session(conn, sid, system_prompt)
-    dropped = _trim_history(messages)
+    dropped = _trim_history(messages, keep_rounds)
     if dropped:
-        sys.stdout.write("history load trimmed earlier tool calls: removed %d messages.\n" % dropped)
+        sys.stdout.write("history load trimmed tool calls from earlier rounds: removed %d messages.\n" % dropped)
     fixed = _close_tool_calls(messages)
     if fixed:
         sys.stdout.write("history load filled in %d unfinished tool results.\n" % fixed)
@@ -1840,15 +1817,17 @@ def load_history(conn, sid, system_prompt):
 
 
 def run_turn(user_text, messages, opts, out):
+    # the user has actually spoken, so create the session in the database now (lazy creation, see _new_session/_ensure_session)
+    _ensure_session(opts, out, messages[0].get("content") if messages else None)
     out.log("USER", user_text)
     # The first Ctrl+C within the turn interrupts only the turn (see _handle_sigint); busy is reset by main at the end
     _INTERRUPT["busy"], _INTERRUPT["seen"] = True, False
-    # Slim down before each turn starts: keep only the most recent batch of tool calls, remove all earlier calls and results
-    dropped = _trim_history(messages)
+    # Slim down before each turn starts: keep only the complete tool round-trips of the most recent rounds, remove those of earlier rounds
+    dropped = _trim_history(messages, opts["tool_rounds"])
     if dropped:
         out.log("TRIM", "removed tool calls and results from earlier rounds: %d messages" % dropped)
     messages.append({"role": "user", "content": user_text})
-    repeat = {"key": None, "n": 0}  # guard rail against consecutive identical tool calls
+    repeat = {"key": None, "n": 0}  # guard rail against consecutive equivalent tool calls
 
     for _ in range(opts["max_steps"]):
         out.step += 1
@@ -1947,15 +1926,16 @@ def run_turn(user_text, messages, opts, out):
                 messages.append({"role": "tool", "tool_call_id": tc.get("id"), "content": result})
                 continue
 
-            key = "%s|%s" % (name, raw_args)
+            key = _repeat_key(name, args)
             repeat["n"] = repeat["n"] + 1 if key == repeat["key"] else 1
             repeat["key"] = key
             if repeat["n"] >= MAX_REPEAT_CALLS:
                 aborted = True
                 abort_note = "Error: this turn was aborted due to repeated calls, this call did not execute."
-                abort_info = "detected %d consecutive identical calls, this turn was stopped" % MAX_REPEAT_CALLS
-                result = ("Error: the identical %s call has appeared %d times in a row, this turn was aborted and this call did not execute."
-                          "Please try a different approach, or state your conclusion directly." % (name, repeat["n"]))
+                abort_info = "detected %d consecutive equivalent calls, this turn was stopped" % MAX_REPEAT_CALLS
+                result = ("Error: the equivalent %s call has appeared %d times in a row, this turn was aborted and this call did not execute."
+                          "That file/command has already been run; use the result you already have, or try a different approach."
+                          % (name, repeat["n"]))
             else:
                 try:
                     func = TOOL_FUNCS.get(name)
@@ -1994,7 +1974,7 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Note: --yes means \"manual confirmation is required before a command runs\". Without --yes commands run by default.\n"
                "Connection-type arguments passed explicitly (-m/--model, -b/--base-url, -k/--api-key, "
-               "-s/--max-steps, -t/--http-timeout, -d/--db) are encrypted and recorded in .bo in the user's home directory, "
+               "-s/--max-steps, -t/--http-timeout, -T/--tool, -d/--db) are encrypted and recorded in .bo in the user's home directory, "
                "and reused automatically afterwards when no arguments or only some are passed; deleting .bo restores the defaults."
                "Priority: command line > environment variables > .bo > built-in defaults.")
     parser.add_argument("-m", "--model", default=S,
@@ -2007,6 +1987,8 @@ def parse_args():
                         help="enable manual confirmation for each command before it runs (without it commands run by default)")
     parser.add_argument("-s", "--max-steps", type=int, default=S, help="max number of tool call rounds per turn")
     parser.add_argument("-t", "--http-timeout", type=int, default=S, help="timeout in seconds for a single HTTP request")
+    parser.add_argument("-T", "--tool", type=int, default=S, dest="tool_rounds", metavar="N",
+                        help="keep the complete tool round-trips of the most recent N user-input rounds in the history (default %d)" % TRIM_KEEP_ROUNDS)
     parser.add_argument("-q", "--quiet", action="store_true",
                         help="show only the final answer, hide all tool/thinking output")
     parser.add_argument("-v", "--verbose", action="count", default=0,
@@ -2042,6 +2024,7 @@ def parse_args():
     api_key = pick("api_key", env("OPENAI_API_KEY") or None, "")
     max_steps = pick("max_steps", None, 50)
     http_timeout = pick("http_timeout", None, 120)
+    tool_rounds = max(_int(pick("tool_rounds", None, TRIM_KEEP_ROUNDS), TRIM_KEEP_ROUNDS, minimum=0), 0)
     db_path = pick("db_path", env("BO_DB") or None, DEFAULT_DB_FILE)
     db_path = os.path.expanduser(db_path)
 
@@ -2055,7 +2038,8 @@ def parse_args():
 
     # Only connection-type arguments passed explicitly this time are written back to .bo, keeping the other keys in the file (key names as in CONFIG_KEYS)
     resolved = {"model": model, "base_url": base_url, "api_key": api_key,
-                "max_steps": max_steps, "http_timeout": http_timeout, "db_path": db_path}
+                "max_steps": max_steps, "http_timeout": http_timeout,
+                "tool_rounds": tool_rounds, "db_path": db_path}
     updates = {k: resolved[k] for k in CONFIG_KEYS if k in a_vars}
 
     config_saved, config_error = False, None
@@ -2092,6 +2076,7 @@ def parse_args():
         "model": model, "base_url": base_url, "api_key": api_key,
         "confirm": confirm,
         "max_steps": max_steps, "http_timeout": http_timeout, "cwd": os.getcwd(),
+        "tool_rounds": tool_rounds,
         "level": level, "color": color, "db_path": db_path,
         "config_status": cfg_status, "config_saved": config_saved, "config_error": config_error,
         "config_used": bool(used_cfg),
@@ -2117,11 +2102,31 @@ def setup_stdio():
 
 
 def _new_session(opts, out):
-    """Close the old session and start a new one (shared by process startup and /reset)."""
+    """Mark that "the next real reply belongs to a new session"; the actual database record is created lazily on the user's first input.
+
+    Startup or /reset does not create a session right away: it only closes the previous one and clears session_id. That way,
+    starting the program just to look and then exiting (or quitting right after /reset) leaves no empty session in the database,
+    and /s lists only sessions that were actually used.
+    """
     db_close_session(out.conn, out.session_id, "closed")
-    sid, _no = db_new_session(out.conn, opts)
-    out.session_id = sid
+    out.session_id = None
     out.step = 0
+
+
+def _ensure_session(opts, out, system_prompt=None):
+    """Create the session record on the first real reply (lazy creation); returns immediately if a session already exists.
+
+    Creating the session also writes the two starting events, SESSION BEGIN and SYSTEM —— they used to be written at process
+    startup, and with lazy creation they can only land once the session really exists.
+    """
+    if out.session_id is None:
+        sid = db_new_session(out.conn, opts)
+        out.session_id = sid
+        out.log("SESSION BEGIN", "no: %d\nmodel=%s\nbase_url=%s\ncwd=%s\nlevel=%s" % (
+            sid, opts["model"], opts["base_url"], opts["cwd"], opts["level"]))
+        if system_prompt:
+            out.log("SYSTEM", system_prompt)
+    return out.session_id
 
 
 def main():
@@ -2134,15 +2139,17 @@ def main():
         sys.stderr.write("cannot use the session database, exiting.\n")
         sys.exit(1)
     out = Output(opts["level"], opts["color"], conn, None)
-    _new_session(opts, out)
     system_prompt = build_system_prompt(opts)
+    # No session is created here: starting the program just to look and then exiting (or quitting right after /reset)
+    # leaves no empty session, because the actual database record is created lazily on the user's first input
+    # (see run_turn -> _ensure_session)
 
     sys.stdout.write(
         "BO -- minimal coding agent (Python %s, %s)\n"
-        "model: %s\nAPI: %s\ncommand confirmation: %s\ndisplay level: %s\nsession: #%d\n"
+        "model: %s\nAPI: %s\ncommand confirmation: %s\ndisplay level: %s\ntool history: keep the most recent %d rounds\n"
         % (platform.python_version(), platform.system(), opts["model"], opts["base_url"],
            "on (--yes)" if opts["confirm"] else "off (run by default)",
-           LEVEL_NAMES[opts["level"]], out.session_id))
+           LEVEL_NAMES[opts["level"]], opts["tool_rounds"]))
     sys.stdout.write("session database: %s\n" % opts["db_path"])
     if opts["config_status"] == "invalid":
         sys.stderr.write("warning: %s exists but cannot be decrypted/parsed (or was not generated on this machine), ignored\n" % CONFIG_FILE)
@@ -2154,9 +2161,6 @@ def main():
         sys.stderr.write("warning: writing %s failed: %s\n" % (CONFIG_FILE, opts["config_error"]))
     sys.stdout.write("type /help for help, exit to quit.\n")
 
-    out.log("SESSION BEGIN", "no: %d\nmodel=%s\nbase_url=%s\ncwd=%s\nlevel=%s" % (
-        out.session_id, opts["model"], opts["base_url"], opts["cwd"], opts["level"]))
-    out.log("SYSTEM", system_prompt)
     messages = [{"role": "system", "content": system_prompt}]
     started = time.time()
 
@@ -2175,8 +2179,7 @@ def main():
             if user == "/reset":
                 _new_session(opts, out)
                 messages = [{"role": "system", "content": system_prompt}]
-                out.log("RESET", "conversation history cleared, a new session was started")
-                sys.stdout.write("cleared the conversation history, started new session #%d.\n" % out.session_id)
+                sys.stdout.write("cleared the conversation history, a new session starts with your next input.\n")
                 continue
             if user == "/s":
                 try:
@@ -2186,7 +2189,7 @@ def main():
                     sys.stdout.write("session selection failed: %s\n" % e)
                     continue
                 if sid is not None:
-                    loaded = load_history(out.conn, sid, system_prompt)
+                    loaded = load_history(out.conn, sid, system_prompt, opts["tool_rounds"])
                     if loaded:
                         # Finish the current session, then switch back to continue the loaded session
                         prev = out.session_id
@@ -2232,8 +2235,10 @@ def main():
         # fallback: pressing Ctrl+C again during the error/interrupt cleanup, to avoid throwing a raw traceback
         sys.stdout.write("\nbye.\n")
     finally:
-        out.log("SESSION END", "no: %d\nelapsed: %.1fs" % (out.session_id, time.time() - started))
-        db_close_session(out.conn, out.session_id, "closed")
+        # when there was never any real input (session_id still empty) write no event and create no empty session
+        if out.session_id is not None:
+            out.log("SESSION END", "no: %d\nelapsed: %.1fs" % (out.session_id, time.time() - started))
+            db_close_session(out.conn, out.session_id, "closed")
         try:
             out.conn.close()
         except Exception:
