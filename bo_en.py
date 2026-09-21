@@ -64,7 +64,7 @@ MAX_READ_MB = MAX_READ_BYTES // 1048576  # the limit in MB, reused by notice tex
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024  # max size of a single HTTP response
 MAX_SEARCH_FILE_BYTES = 2 * 1024 * 1024  # max bytes read per file by search
 MAX_SEARCH_RESULTS = 1000            # max number of result lines returned by one search
-MAX_EDITS = 50                       # max entries in the write_file edits array per call
+MAX_EDITS = 50                       # max entries in the edit_file edits array per call
 MAX_COMMAND_TIMEOUT = 3600           # run_command timeout limit (seconds)
 MAX_COMMAND_OUTPUT_BYTES = 256 * 1024  # max output run_command keeps in memory (half at each end, then truncated to the visible length)
 MAX_DIR_ITEMS = 1000                 # max items displayed at once when read_file lists a directory
@@ -140,29 +140,32 @@ def _arr(desc, item_props, item_required):
 
 TOOLS = [
     _fn("read_file", "read a file (with line numbers) or list a directory; offset starts at 1 and an offset for continued reading is given when the file is not fully read, "
-        "binary files are refused. Do not include line numbers in write_file's old_string.",
+        "binary files are refused. Each output line carries a \"line number+Tab\" prefix; strip it when copying into edit_file's old_string.",
         {"path": _p("string", "file or directory path (relative or absolute)"),
          "offset": _p("integer", "starting line number / starting item, starting at 1, default 1"),
          "limit": _p("integer", "max lines to read for a file (default 2000) / max items to list for a directory (default 200)")},
         ["path"]),
-    _fn("write_file", "write a file, two modes [never mix them]:\n"
-        "(1) create/overwrite whole file: give only path + content (do not give old_string/new_string/edits).\n"
-        "(2) change only part: give only path + old_string + new_string (or edits to submit several spots at once), "
-        "and in that case [do not give content].\n"
-        "Counter-example (will fail): giving both content and old_string. Correct approach: to change part, give only old_string+new_string.\n"
-        "old_string must appear verbatim in the file and be unique (trailing spaces/indentation must match, do not include line numbers), "
-        "otherwise an error is reported and candidate lines are listed; submit several different changes at once with edits; a missing parent directory is created automatically; empty content is refused.",
+    _fn("write_file", "create a new file or overwrite an existing one: give path + content. content is the complete final content of the file, "
+        "cannot be empty; a missing parent directory is created automatically. To change only part of a file do not use this tool, use edit_file instead.",
         {"path": _p("string", "file path"),
-         "content": _p("string", "the complete text to write as a whole (choose one of this or old_string/edits, cannot be empty)"),
-         "old_string": _p("string", "the original text being replaced, must be unique in the file (choose one of this or content; do not include line numbers)"),
-         "new_string": _p("string", "the new text after replacement (choose one of this or content)"),
+         "content": _p("string", "the complete final content of the file (cannot be empty)")},
+        ["path", "content"]),
+    _fn("edit_file", "make a partial change to an existing file: replace old_string verbatim with new_string. Requirements:\n"
+        "- old_string must appear verbatim in the file and be unique; when it is not unique, add more surrounding lines to make it unique, "
+        "or set replace_all=true to replace every occurrence.\n"
+        "- text copied from read_file output must have its \"line number+Tab\" prefix stripped; keep trailing spaces/indentation verbatim, "
+        "and do not start or end old_string or new_string with a newline.\n"
+        "- submit several different changes at once with edits, applied in order; if any fails the whole batch is not written.",
+        {"path": _p("string", "path of an existing file"),
+         "old_string": _p("string", "the original text being replaced, must be unique in the file, do not include line numbers"),
+         "new_string": _p("string", "the new text after replacement"),
          "replace_all": _p("boolean", "when true, replace every occurrence, default false"),
-         "edits": _arr("submit several changes at once, applied in order; if any fails the whole batch is not written (choose one of this or content)",
+         "edits": _arr("submit several changes at once, applied in order; if any fails the whole batch is not written",
                        {"old_string": _p("string", "the original text being replaced (do not include line numbers)"),
                         "new_string": _p("string", "the new text after replacement"),
                         "replace_all": _p("boolean", "replace every occurrence, default false")},
                        ["old_string", "new_string"])},
-        ["path"]),
+        ["path", "old_string", "new_string"]),
     _fn("search", "search files or directories with a regular expression (case-sensitive; use the (?i) prefix to ignore case), skipping .git / __pycache__ / "
         "node_modules and similar directories as well as binary and oversized files. Uses less output than running grep via run_command.",
         {"pattern": _p("string", "regular expression; when it is not a valid regex, it is searched literally"),
@@ -220,10 +223,7 @@ def _truncate(text, limit=MAX_OUTPUT_CHARS, note=None):
     if len(text) <= limit:
         return text
     note = note or "\n... [truncated, the original text has %d characters]"
-    try:
-        return text[:limit] + note % len(text)
-    except TypeError:
-        return text[:limit] + note
+    return text[:limit] + (note % len(text) if "%d" in note else note)
 
 
 def _indent(text, prefix="    ", limit=MAX_OUTPUT_CHARS):
@@ -292,13 +292,6 @@ def _truncate_middle(text, limit=MAX_OUTPUT_CHARS):
 # ---------------------------------------------------------------------------
 # File access (path normalization, size limits and atomic writes)
 # ---------------------------------------------------------------------------
-
-def _resolve(path, opts):
-    """Normalize a path to its real path, returning (real path, error message). opts is kept to keep the call signature uniform."""
-    if not path:
-        return None, "Error: missing path argument"
-    return os.path.realpath(path), None
-
 
 def _read_file_bytes(path):
     """Read an entire file with a size limit. Returns (bytes, error message)."""
@@ -515,17 +508,13 @@ def save_config(cfg, path):
 
 def tool_read_file(args, opts):
     shown = args.get("path")
-    path, err = _resolve(shown, opts)
-    if err:
-        return err
+    if not shown:
+        return "Error: missing path argument"
+    path = os.path.realpath(shown)
     offset = max(_int(args.get("offset"), 1, minimum=1) - 1, 0)  # 1-based externally, 0-based internally
     if os.path.isdir(path):
         return _list_dir(path, shown, offset,
                          min(_int(args.get("limit"), 200, minimum=1), MAX_DIR_ITEMS))
-    if not os.path.exists(path):
-        return "Error: file does not exist: %s" % shown
-    if not os.path.isfile(path):
-        return "Error: not a regular file (device file, etc.): %s" % shown
 
     limit = _int(args.get("limit"), 2000, minimum=1)
     lines, total, err = _read_lines_window(path, shown, offset, limit)
@@ -558,47 +547,30 @@ def tool_read_file(args, opts):
     return header + "\n" + "\n".join(shown_lines) + footer
 
 
-def _pick_write_mode(args):
-    """Decide the write mode from the arguments, returning (execution function, extra hint); when the argument combination is invalid the function is None and the hint is the error message."""
-    has_content = args.get("content") is not None
-    has_edit = (args.get("edits") is not None or args.get("old_string") is not None
-                or args.get("new_string") is not None)
-    if has_content and has_edit:
-        # Model slip-up: it stuffed the whole context into content and also gave old_string/new_string.
-        # As long as new_string / edits is present the intent is a partial replace, so ignore content and just do it.
-        if args.get("new_string") is not None or args.get("edits") is not None:
-            return _edit_existing_file, ("\nHint: detected that content was given at the same time; treated it as a \"partial replace\""
-                                          " and ignored content. If you really want to overwrite the whole file, pass only content.")
-        return None, ("Error: content and old_string/new_string/edits cannot be used together."
-                      "To write the whole file give only content; for a partial replace give only old_string + new_string or edits."
-                      "(If you wanted a partial replace, please add new_string.)")
-    if has_edit:
-        return _edit_existing_file, ""
-    if not has_content:
-        hint = ""
-        if args.get("replace_all") is not None:
-            hint = "(replace_all only works together with old_string/new_string/edits, it had no effect this time)"
-        return None, ("Error: missing arguments. Writing the whole file needs content; a partial replace needs old_string + new_string, "
-                      "or use edits to submit several changes at once." + hint)
-    if args.get("replace_all") is not None:
-        return _write_whole_file, ("\nHint: replace_all only works for a partial replace (old_string/new_string or edits)"
-                                    ", so this whole-file write ignored the argument.")
-    return _write_whole_file, ""
-
-
 def tool_write_file(args, opts):
-    """Write a file: automatically choose between "write the whole file" and "exact replace" based on the arguments."""
+    """Create a new file or overwrite it (path + content); partial changes belong to edit_file."""
     shown = args.get("path")
-    path, err = _resolve(shown, opts)
-    if err:
-        return err
-    func, hint = _pick_write_mode(args)
-    if func is None:
-        return hint  # invalid argument combination, the hint is the error message
-    result = func(path, shown, args)
-    if hint and result.startswith("OK:"):  # only append the hint on success
-        result += hint
-    return result
+    if not shown:
+        return "Error: missing path argument"
+    if (args.get("old_string") is not None or args.get("new_string") is not None
+            or args.get("edits") is not None):
+        return ("Error: write_file only writes whole files. Use edit_file"
+                " (path + old_string + new_string) for a partial change;"
+                " if you really want to overwrite the whole file, drop these arguments and retry.")
+    if args.get("content") is None:
+        return "Error: missing content argument (the complete content to write)."
+    return _write_whole_file(os.path.realpath(shown), shown, args)
+
+
+def tool_edit_file(args, opts):
+    """Make a partial change to an existing file (old_string/new_string or edits); whole-file writes belong to write_file."""
+    shown = args.get("path")
+    if not shown:
+        return "Error: missing path argument"
+    if args.get("content") is not None:
+        return ("Error: edit_file only makes partial changes and does not accept content."
+                " Use write_file (path + content) to create or overwrite a whole file.")
+    return _edit_existing_file(os.path.realpath(shown), shown, args)
 
 
 def _write_whole_file(path, shown, args):
@@ -616,7 +588,7 @@ def _write_whole_file(path, shown, args):
     enc, old_lines, old_bytes = "utf-8", 0, 0
     if existed:
         if os.path.getsize(path) > MAX_READ_BYTES:
-            return "Error: target file too large (> %d MB), refusing to overwrite the whole file; use old_string/new_string for a partial change instead" % (
+            return "Error: target file too large (> %d MB), refusing to overwrite the whole file; use edit_file for a partial change instead" % (
                 MAX_READ_BYTES // 1048576)
         raw, err = _read_file_bytes(path)
         if err:
@@ -651,7 +623,7 @@ def _write_whole_file(path, shown, args):
     result = "OK: overwrote %s (was %d lines/%d bytes → now %d lines/%d bytes, encoding %s)%s" % (
         shown, old_lines, old_bytes, new_lines, new_bytes, enc, enc_note)
     if old_bytes and new_bytes < old_bytes * 0.5 and new_lines < old_lines:
-        result += "\nNote: the new content is %.0f%% smaller than the original file; if you only meant to change part of it use old_string/new_string." % (
+        result += "\nNote: the new content is %.0f%% smaller than the original file; if you only meant to change part of it use edit_file." % (
             (1 - new_bytes / float(old_bytes)) * 100)
     return result
 
@@ -869,7 +841,7 @@ def _apply_edit(text, edit):
 
 
 def _edit_existing_file(path, shown, args):
-    """Mode two: exact string replacement on an existing file (old_string/new_string or edits)."""
+    """Exact string replacement on an existing file (old_string/new_string or edits)."""
     edits = args.get("edits")
     if edits is None:
         if args.get("old_string") is None or args.get("new_string") is None:
@@ -883,7 +855,7 @@ def _edit_existing_file(path, shown, args):
         return "Error: edits accepts at most %d entries at a time, please submit in batches" % MAX_EDITS
 
     if not os.path.isfile(path):
-        return "Error: file does not exist or is not a regular file: %s (to create a file pass the content argument)" % shown
+        return "Error: file does not exist or is not a regular file: %s (to create a file use write_file with content)" % shown
     raw, err = _read_file_bytes(path)
     if err:
         return err
@@ -963,9 +935,7 @@ def tool_search(args, opts):
         literal = True
 
     shown = args.get("path") or "."
-    target, err = _resolve(shown, opts)
-    if err:
-        return err
+    target = os.path.realpath(shown)
     if not os.path.exists(target):
         return "Error: path does not exist: %s" % shown
 
@@ -1096,9 +1066,7 @@ def tool_run_command(args, opts):
 
     cwd = opts["cwd"]
     if args.get("cwd"):
-        cwd, err = _resolve(args.get("cwd"), opts)
-        if err:
-            return err
+        cwd = os.path.realpath(args.get("cwd"))
         if not os.path.isdir(cwd):
             return "Error: cwd is not a directory: %s" % args.get("cwd")
 
@@ -1155,14 +1123,8 @@ def tool_run_command(args, opts):
 
 
 TOOL_FUNCS = {"read_file": tool_read_file, "write_file": tool_write_file,
+              "edit_file": tool_edit_file,
               "search": tool_search, "run_command": tool_run_command}
-
-
-def execute_tool(name, args, opts):
-    func = TOOL_FUNCS.get(name)
-    if func is None:
-        return "Error: unknown tool %s" % name
-    return func(args, opts)
 
 
 # ---------------------------------------------------------------------------
@@ -1193,18 +1155,23 @@ def _merge_tool_call_delta(acc, delta):
             slot["function"]["arguments"] += fn["arguments"]
 
 
+def _http_open(req, timeout):
+    """Open an HTTP request; HTTP/network errors are uniformly turned into RuntimeError (shared by fetch_models and call_llm)."""
+    try:
+        return urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        raise RuntimeError("HTTP %s error: %s" % (e.code, _truncate(_decode_bytes(e.read())[0], 2000)))
+    except urllib.error.URLError as e:
+        raise RuntimeError("network error: %s" % e.reason)
+
+
 def fetch_models(opts):
     """Request /models and return the model ids the endpoint supports (in the endpoint's own order)."""
     url = opts["base_url"].rstrip("/") + "/models"
     req = urllib.request.Request(url, method="GET")
     if opts["api_key"]:
         req.add_header("Authorization", "Bearer " + opts["api_key"])
-    try:
-        resp = urllib.request.urlopen(req, timeout=opts["http_timeout"])
-    except urllib.error.HTTPError as e:
-        raise RuntimeError("HTTP %s error: %s" % (e.code, _truncate(_decode_bytes(e.read())[0], 2000)))
-    except urllib.error.URLError as e:
-        raise RuntimeError("network error: %s" % e.reason)
+    resp = _http_open(req, opts["http_timeout"])
     try:
         raw = resp.read(MAX_RESPONSE_BYTES + 1)
     except Exception as e:
@@ -1244,12 +1211,7 @@ def call_llm(messages, opts, on_delta=None):
     saw_sse = False
     usage = None
 
-    try:
-        resp = urllib.request.urlopen(req, timeout=opts["http_timeout"])
-    except urllib.error.HTTPError as e:
-        raise RuntimeError("HTTP %s error: %s" % (e.code, _truncate(_decode_bytes(e.read())[0], 2000)))
-    except urllib.error.URLError as e:
-        raise RuntimeError("network error: %s" % e.reason)
+    resp = _http_open(req, opts["http_timeout"])
     latency_ms = int((time.time() - _t0) * 1000)
 
     try:
@@ -1380,7 +1342,6 @@ def db_new_session(conn, opts):
         " cwd, host, pid, bo_version) VALUES(NULL, ?, 0, 'running', ?, ?, ?, ?, ?, ?)",
         (time.time(), opts["model"], opts["base_url"], opts["cwd"],
          platform.node(), os.getpid(), BO_VERSION))
-    conn.commit()
     sid = cur.lastrowid
     conn.execute("UPDATE sessions SET session_no=? WHERE id=?", (sid, sid))
     conn.commit()
@@ -1412,11 +1373,10 @@ def db_add_event(conn, session_id, step, kind, content="", role=None,
         (session_id, (row[0] or 0) + 1, time.time(), step, kind, role, content,
          tool_name, tool_call_id, tool_args, 1 if is_error else 0, latency_ms,
          tokens_prompt, tokens_completion))
-    conn.commit()
     if kind == "user" and content:
         conn.execute("UPDATE sessions SET title=? WHERE id=? AND title IS NULL",
                      (_first_line(content)[:60], session_id))
-        conn.commit()
+    conn.commit()
 
 
 def db_bump_tokens(conn, session_id, usage, latency_ms):
@@ -1534,55 +1494,41 @@ def db_load_session(conn, sid, system_prompt=None):
 
 
 
+def _pick(items, prompt):
+    """Print a numbered list and let the user choose, returning the selected 0-based index; a bare Enter cancels silently, other invalid input gets a notice."""
+    for i, it in enumerate(items):
+        sys.stdout.write("  [%d] %s\n" % (i + 1, it))
+    try:
+        choice = input(prompt).strip()
+    except (EOFError, KeyboardInterrupt):
+        sys.stdout.write("\ncancelled.\n")
+        return None
+    if not choice:
+        return None
+    if choice.isdigit() and 1 <= int(choice) <= len(items):
+        return int(choice) - 1
+    sys.stdout.write("not a valid number.\n")
+    return None
+
+
 def choose_session(conn):
     """Interactively list recent sessions and let the user choose. Returns the selected session_id or None."""
     rows = db_list_sessions(conn, 10)
     if not rows:
         sys.stdout.write("no past sessions yet.\n")
         return None
-    for sid, no, title, started, status in rows:
-        ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(started or 0))
-        label = (title or "(untitled)")
-        sys.stdout.write("  [%d] %s  %s  (%s)\n" % (sid, label[:40], ts, status))
-    try:
-        choice = input("which session to load? enter a number (Enter to cancel) > ").strip()
-    except (EOFError, KeyboardInterrupt):
-        sys.stdout.write("\ncancelled.\n")
-        return None
-    if not choice:
-        return None
-    try:
-        sid = int(choice)
-    except ValueError:
-        sys.stdout.write("not a valid number.\n")
-        return None
-    if not any(r[0] == sid for r in rows):
-        sys.stdout.write("no such session.\n")
-        return None
-    return sid
+    items = ["%s  %s  (%s)" % ((title or "(untitled)")[:40],
+             time.strftime("%Y-%m-%d %H:%M", time.localtime(started or 0)), status)
+             for _sid, _no, title, started, status in rows]
+    idx = _pick(items, "which session to load? enter a number (Enter to cancel) > ")
+    return rows[idx][0] if idx is not None else None
 
 
 def choose_model(opts):
     """List the models the endpoint supports and let the user pick one by number. Returns the chosen model name or None."""
     ids = fetch_models(opts)
-    for i, mid in enumerate(ids):
-        sys.stdout.write("  [%d] %s\n" % (i + 1, mid))
-    try:
-        choice = input("which model? enter a number (Enter to cancel) > ").strip()
-    except (EOFError, KeyboardInterrupt):
-        sys.stdout.write("\ncancelled.\n")
-        return None
-    if not choice:
-        return None
-    try:
-        idx = int(choice)
-    except ValueError:
-        sys.stdout.write("not a valid number.\n")
-        return None
-    if idx < 1 or idx > len(ids):
-        sys.stdout.write("no such model.\n")
-        return None
-    return ids[idx - 1]
+    idx = _pick(ids, "which model? enter a number (Enter to cancel) > ")
+    return ids[idx] if idx is not None else None
 
 
 # ---------------------------------------------------------------------------
@@ -1712,10 +1658,10 @@ def build_system_prompt(opts):
         "\n"
         "available tools:\n%s\n"
         "\n"
-        "approach: locate with search first, then read_file to see the fragment clearly, then write_file (give content to write the whole file, "
-        "give old_string + new_string for a partial change), and finally verify with run_command (run tests/compile/execute scripts); "
+        "approach: locate with search first, then read_file to see the fragment clearly, then write_file (create/overwrite with content) "
+        "or edit_file (a partial change with old_string + new_string), and finally verify with run_command (run tests/compile/execute scripts); "
         "do not guess out of thin air.\n"
-        "always create new files with write_file's content mode; do not assemble files with echo/cat redirection via run_command; "
+        "always create new files with write_file; do not assemble files with echo/cat redirection via run_command; "
         "delete or move files with rm / mv via run_command, and confirm dangerous operations with the user first.\n"
         "\n"
         "output: this is a plain-text terminal that does not render Markdown. Do not use syntax such as bold, headings or code fences. Answer concisely and directly.\n"
@@ -1852,22 +1798,6 @@ def _drop_tool_calls_by_id(messages, ids):
                     continue                      # broken calls only and no content, drop the whole message
         out.append(m)
     messages[:] = out
-
-
-def _close_dangling_tool_calls(messages, note):
-    """Add a result to the batch of tool_calls missing one, keeping the message history legal.
-
-    An interrupt/exception may land outside the tool loop, in which case the assistant's tool_calls are already in the history with nobody answering,
-    and the next request would be judged a format error by the API; this fills them in uniformly. Returns how many were added.
-    """
-    answered = set(m.get("tool_call_id") for m in messages if m.get("role") == "tool")
-    for m in reversed(messages):
-        if m.get("role") == "assistant" and m.get("tool_calls"):
-            pending = [tc for tc in m["tool_calls"] if tc.get("id") not in answered]
-            for tc in pending:
-                messages.append({"role": "tool", "tool_call_id": tc.get("id"), "content": note})
-            return len(pending)
-    return 0
 
 
 def _close_tool_calls(messages):
@@ -2018,10 +1948,8 @@ def run_turn(user_text, messages, opts, out):
                 continue
 
             key = "%s|%s" % (name, raw_args)
-            if key == repeat["key"]:
-                repeat["n"] += 1
-            else:
-                repeat["key"], repeat["n"] = key, 1
+            repeat["n"] = repeat["n"] + 1 if key == repeat["key"] else 1
+            repeat["key"] = key
             if repeat["n"] >= MAX_REPEAT_CALLS:
                 aborted = True
                 abort_note = "Error: this turn was aborted due to repeated calls, this call did not execute."
@@ -2030,7 +1958,8 @@ def run_turn(user_text, messages, opts, out):
                           "Please try a different approach, or state your conclusion directly." % (name, repeat["n"]))
             else:
                 try:
-                    result = execute_tool(name, args, opts)
+                    func = TOOL_FUNCS.get(name)
+                    result = func(args, opts) if func else "Error: unknown tool %s" % name
                 except TurnInterrupted:
                     # interrupted halfway through tool execution: the result is untrustworthy, and later calls are not run either
                     result = ("Error: the user interrupted this turn with Ctrl+C, this call did not finish properly;"
@@ -2142,11 +2071,9 @@ def parse_args():
         try:
             chosen = choose_model({"base_url": base_url, "api_key": api_key,
                                    "http_timeout": http_timeout})
-        except RuntimeError as e:
-            sys.stderr.write("failed to fetch the model list: %s\n" % e)
-            sys.exit(1)
         except Exception as e:
-            sys.stderr.write("failed to fetch the model list: %s: %s\n" % (type(e).__name__, e))
+            msg = str(e) if isinstance(e, RuntimeError) else "%s: %s" % (type(e).__name__, e)
+            sys.stderr.write("failed to fetch the model list: %s\n" % msg)
             sys.exit(1)
         if chosen is None:
             sys.stdout.write("model unchanged.\n")
@@ -2180,18 +2107,11 @@ def setup_stdio():
         stream = getattr(sys, name, None)
         if stream is None:
             continue
-        reconfigure = getattr(stream, "reconfigure", None)
-        if reconfigure is not None:
-            try:
-                reconfigure(encoding="utf-8", errors="replace")
-                continue
-            except Exception:
-                pass
-        buf = getattr(stream, "buffer", None)
-        if buf is None:
-            continue
         try:
-            setattr(sys, name, io.TextIOWrapper(buf, encoding="utf-8", errors="replace"))
+            if hasattr(stream, "reconfigure"):          # Python 3.7+
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            elif getattr(stream, "buffer", None) is not None:   # 3.6: wrap a TextIOWrapper
+                setattr(sys, name, io.TextIOWrapper(stream.buffer, encoding="utf-8", errors="replace"))
         except Exception:
             pass
 
@@ -2268,12 +2188,10 @@ def main():
                 if sid is not None:
                     loaded = load_history(out.conn, sid, system_prompt)
                     if loaded:
-                        # First finish the current session and the empty shell just created, then switch back to continue the loaded session
+                        # Finish the current session, then switch back to continue the loaded session
                         prev = out.session_id
-                        _new_session(opts, out)
-                        db_close_session(out.conn, out.session_id, "closed")
-                        out.session_id = sid
-                        out.step = 0
+                        db_close_session(out.conn, prev, "closed")
+                        out.session_id, out.step = sid, 0
                         db_close_session(out.conn, sid, "running")
                         if prev != sid:
                             out.log("RESET", "loaded session #%d (%d messages), current session #%d was finished"
@@ -2299,8 +2217,7 @@ def main():
                 sys.stdout.write("\nbye.\n")
                 break
             except TurnInterrupted:     # fallback: the interrupt landed outside the generation/tool loop
-                _close_dangling_tool_calls(
-                    messages, "Error: this turn was interrupted by Ctrl+C, this call did not execute.")
+                _close_tool_calls(messages)
                 out.info("\n[this turn was interrupted; press Ctrl+C again to quit the program]")
             except RuntimeError as e:
                 out.log("ERROR", str(e))

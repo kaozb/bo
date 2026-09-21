@@ -140,29 +140,32 @@ def _arr(desc, item_props, item_required):
 
 TOOLS = [
     _fn("read_file", "读取文件（带行号）或列出目录，offset 从 1 开始、未读完会给出续读 offset，"
-        "二进制文件拒绝读取。write_file 的 old_string 不要带行号。",
+        "二进制文件拒绝读取。输出每行带「行号+Tab」前缀，复制给 edit_file 的 old_string 时必须去掉。",
         {"path": _p("string", "文件或目录路径（相对或绝对）"),
          "offset": _p("integer", "起始行号 / 起始项目，从 1 开始，默认 1"),
          "limit": _p("integer", "文件最多读取行数（默认 2000）/ 目录最多列出项数（默认 200）")},
         ["path"]),
-    _fn("write_file", "写文件，两种模式【严禁混用】：\n"
-        "① 新建/整体覆盖：只给 path + content（不要给 old_string/new_string/edits）。\n"
-        "② 只改局部：只给 path + old_string + new_string（或 edits 一次提交多处），"
-        "此时【不要给 content】。\n"
-        "反例（会失败）：同时给 content 和 old_string。正确做法：改局部就只给 old_string+new_string。\n"
-        "old_string 必须原样出现在文件中且唯一（行尾空格/缩进都要一致，不要带行号），"
-        "否则报错并列出候选行；多处不同修改用 edits 一次提交；父目录不存在会自动创建；content 为空会被拒绝。",
+    _fn("write_file", "新建文件或整体覆盖已有文件：给 path + content。content 是文件的完整最终内容，"
+        "不能为空；父目录不存在会自动创建。只改局部不要用本工具，改用 edit_file。",
         {"path": _p("string", "文件路径"),
-         "content": _p("string", "整体写入的完整文本内容（与 old_string/edits 二选一，不能为空）"),
-         "old_string": _p("string", "被替换的原文，需在文件中唯一（与 content 二选一；不要带行号）"),
-         "new_string": _p("string", "替换后的新文本（与 content 二选一）"),
+         "content": _p("string", "文件的完整最终内容（不能为空）")},
+        ["path", "content"]),
+    _fn("edit_file", "局部修改已有文件：把 old_string 原样替换为 new_string。要求:\n"
+        "- old_string 必须原样出现在文件中且唯一；不唯一时扩大上下文行数使其唯一，"
+        "或设 replace_all=true 替换全部出现位置。\n"
+        "- 复制自 read_file 输出的文本必须去掉「行号+Tab」前缀；行尾空格/缩进原样保留，"
+        "old_string 与 new_string 首尾都不要带换行符。\n"
+        "- 多处不同修改用 edits 一次提交，按顺序应用，任一失败则整单不写入。",
+        {"path": _p("string", "已有文件的路径"),
+         "old_string": _p("string", "被替换的原文，需在文件中唯一，不要带行号"),
+         "new_string": _p("string", "替换后的新文本"),
          "replace_all": _p("boolean", "为 true 时替换所有出现位置，默认 false"),
-         "edits": _arr("一次提交多处修改，按顺序应用；任一失败则整单不写入（与 content 二选一）",
+         "edits": _arr("一次提交多处修改，按顺序应用；任一失败则整单不写入",
                        {"old_string": _p("string", "被替换的原文（不要带行号）"),
                         "new_string": _p("string", "替换后的新文本"),
                         "replace_all": _p("boolean", "替换所有出现位置，默认 false")},
                        ["old_string", "new_string"])},
-        ["path"]),
+        ["path", "old_string", "new_string"]),
     _fn("search", "用正则搜索文件或目录（区分大小写，忽略大小写用 (?i) 前缀），跳过 .git / __pycache__ / "
         "node_modules 等目录以及二进制与超大文件。比用 run_command 跑 grep 更省输出。",
         {"pattern": _p("string", "正则表达式；不是合法正则时自动按字面量搜索"),
@@ -220,10 +223,7 @@ def _truncate(text, limit=MAX_OUTPUT_CHARS, note=None):
     if len(text) <= limit:
         return text
     note = note or "\n... [已截断，原文共 %d 字符]"
-    try:
-        return text[:limit] + note % len(text)
-    except TypeError:
-        return text[:limit] + note
+    return text[:limit] + (note % len(text) if "%d" in note else note)
 
 
 def _indent(text, prefix="    ", limit=MAX_OUTPUT_CHARS):
@@ -292,13 +292,6 @@ def _truncate_middle(text, limit=MAX_OUTPUT_CHARS):
 # ---------------------------------------------------------------------------
 # 文件访问（路径规范化、大小上限与原子写入）
 # ---------------------------------------------------------------------------
-
-def _resolve(path, opts):
-    """把路径规范化为真实路径，返回 (真实路径, 错误信息)。opts 保留以统一调用签名。"""
-    if not path:
-        return None, "错误: 缺少 path 参数"
-    return os.path.realpath(path), None
-
 
 def _read_file_bytes(path):
     """读取整个文件，带大小上限。返回 (bytes, 错误信息)。"""
@@ -515,17 +508,13 @@ def save_config(cfg, path):
 
 def tool_read_file(args, opts):
     shown = args.get("path")
-    path, err = _resolve(shown, opts)
-    if err:
-        return err
+    if not shown:
+        return "错误: 缺少 path 参数"
+    path = os.path.realpath(shown)
     offset = max(_int(args.get("offset"), 1, minimum=1) - 1, 0)  # 对外 1 基，内部 0 基
     if os.path.isdir(path):
         return _list_dir(path, shown, offset,
                          min(_int(args.get("limit"), 200, minimum=1), MAX_DIR_ITEMS))
-    if not os.path.exists(path):
-        return "错误: 文件不存在: %s" % shown
-    if not os.path.isfile(path):
-        return "错误: 不是普通文件（设备文件等）: %s" % shown
 
     limit = _int(args.get("limit"), 2000, minimum=1)
     lines, total, err = _read_lines_window(path, shown, offset, limit)
@@ -558,47 +547,29 @@ def tool_read_file(args, opts):
     return header + "\n" + "\n".join(shown_lines) + footer
 
 
-def _pick_write_mode(args):
-    """按参数判断写入模式，返回 (执行函数, 附加提示)；参数组合非法时函数为 None、提示即错误信息。"""
-    has_content = args.get("content") is not None
-    has_edit = (args.get("edits") is not None or args.get("old_string") is not None
-                or args.get("new_string") is not None)
-    if has_content and has_edit:
-        # 模型手滑：把整段上下文塞进 content，又给了 old_string/new_string。
-        # 只要出现了 new_string / edits，意图就是局部替换，忽略 content 直接执行。
-        if args.get("new_string") is not None or args.get("edits") is not None:
-            return _edit_existing_file, ("\n提示: 检测到同时给了 content，已按「局部替换」处理"
-                                          "并忽略 content。若确实要整体覆盖，请只传 content。")
-        return None, ("错误: content 与 old_string/new_string/edits 不能同时使用。"
-                      "整体写入请只给 content；局部替换请只给 old_string + new_string 或 edits。"
-                      "（若想局部替换，请补上 new_string。）")
-    if has_edit:
-        return _edit_existing_file, ""
-    if not has_content:
-        hint = ""
-        if args.get("replace_all") is not None:
-            hint = "（replace_all 只在配合 old_string/new_string/edits 时有效，本次未生效）"
-        return None, ("错误: 缺少参数。整体写入需 content；局部替换需 old_string + new_string，"
-                      "或用 edits 一次提交多处修改。" + hint)
-    if args.get("replace_all") is not None:
-        return _write_whole_file, ("\n提示: replace_all 只在局部替换（old_string/new_string 或 edits）"
-                                    "时有效，本次整体写入已忽略该参数。")
-    return _write_whole_file, ""
-
-
 def tool_write_file(args, opts):
-    """写文件：按参数自动选择「整体写入」或「精确替换」两种模式。"""
+    """新建文件或整体覆盖（path + content）；局部修改属于 edit_file。"""
     shown = args.get("path")
-    path, err = _resolve(shown, opts)
-    if err:
-        return err
-    func, hint = _pick_write_mode(args)
-    if func is None:
-        return hint  # 参数组合非法，提示即错误信息
-    result = func(path, shown, args)
-    if hint and result.startswith("已"):  # 只有成功才附加提示
-        result += hint
-    return result
+    if not shown:
+        return "错误: 缺少 path 参数"
+    if (args.get("old_string") is not None or args.get("new_string") is not None
+            or args.get("edits") is not None):
+        return ("错误: write_file 只做整体写入。局部修改请改用 edit_file"
+                "（path + old_string + new_string）；若确要整体覆盖，请去掉这些参数后重试。")
+    if args.get("content") is None:
+        return "错误: 缺少 content 参数（整体写入的完整内容）。"
+    return _write_whole_file(os.path.realpath(shown), shown, args)
+
+
+def tool_edit_file(args, opts):
+    """局部修改已有文件（old_string/new_string 或 edits）；整体写入属于 write_file。"""
+    shown = args.get("path")
+    if not shown:
+        return "错误: 缺少 path 参数"
+    if args.get("content") is not None:
+        return ("错误: edit_file 只做局部修改，不接受 content。"
+                "整体新建/覆盖请改用 write_file（path + content）。")
+    return _edit_existing_file(os.path.realpath(shown), shown, args)
 
 
 def _write_whole_file(path, shown, args):
@@ -616,7 +587,7 @@ def _write_whole_file(path, shown, args):
     enc, old_lines, old_bytes = "utf-8", 0, 0
     if existed:
         if os.path.getsize(path) > MAX_READ_BYTES:
-            return "错误: 目标文件过大（> %d MB），拒绝整体覆盖；请改用 old_string/new_string 局部修改" % (
+            return "错误: 目标文件过大（> %d MB），拒绝整体覆盖；请改用 edit_file 局部修改" % (
                 MAX_READ_BYTES // 1048576)
         raw, err = _read_file_bytes(path)
         if err:
@@ -651,7 +622,7 @@ def _write_whole_file(path, shown, args):
     result = "已覆盖 %s（原 %d 行/%d 字节 → 现 %d 行/%d 字节，编码 %s）%s" % (
         shown, old_lines, old_bytes, new_lines, new_bytes, enc, enc_note)
     if old_bytes and new_bytes < old_bytes * 0.5 and new_lines < old_lines:
-        result += "\n注意: 新内容比原文件小了 %.0f%%，若只想改局部请改用 old_string/new_string。" % (
+        result += "\n注意: 新内容比原文件小了 %.0f%%，若只想改局部请改用 edit_file。" % (
             (1 - new_bytes / float(old_bytes)) * 100)
     return result
 
@@ -869,7 +840,7 @@ def _apply_edit(text, edit):
 
 
 def _edit_existing_file(path, shown, args):
-    """模式二：对已有文件做精确字符串替换（old_string/new_string 或 edits）。"""
+    """对已有文件做精确字符串替换（old_string/new_string 或 edits）。"""
     edits = args.get("edits")
     if edits is None:
         if args.get("old_string") is None or args.get("new_string") is None:
@@ -883,7 +854,7 @@ def _edit_existing_file(path, shown, args):
         return "错误: edits 一次最多 %d 条，请分批提交" % MAX_EDITS
 
     if not os.path.isfile(path):
-        return "错误: 文件不存在或不是普通文件: %s（新建文件请传 content 参数）" % shown
+        return "错误: 文件不存在或不是普通文件: %s（新建文件请用 write_file 传 content）" % shown
     raw, err = _read_file_bytes(path)
     if err:
         return err
@@ -963,9 +934,7 @@ def tool_search(args, opts):
         literal = True
 
     shown = args.get("path") or "."
-    target, err = _resolve(shown, opts)
-    if err:
-        return err
+    target = os.path.realpath(shown)
     if not os.path.exists(target):
         return "错误: 路径不存在: %s" % shown
 
@@ -1096,9 +1065,7 @@ def tool_run_command(args, opts):
 
     cwd = opts["cwd"]
     if args.get("cwd"):
-        cwd, err = _resolve(args.get("cwd"), opts)
-        if err:
-            return err
+        cwd = os.path.realpath(args.get("cwd"))
         if not os.path.isdir(cwd):
             return "错误: cwd 不是目录: %s" % args.get("cwd")
 
@@ -1155,14 +1122,8 @@ def tool_run_command(args, opts):
 
 
 TOOL_FUNCS = {"read_file": tool_read_file, "write_file": tool_write_file,
+              "edit_file": tool_edit_file,
               "search": tool_search, "run_command": tool_run_command}
-
-
-def execute_tool(name, args, opts):
-    func = TOOL_FUNCS.get(name)
-    if func is None:
-        return "错误: 未知工具 %s" % name
-    return func(args, opts)
 
 
 # ---------------------------------------------------------------------------
@@ -1193,18 +1154,23 @@ def _merge_tool_call_delta(acc, delta):
             slot["function"]["arguments"] += fn["arguments"]
 
 
+def _http_open(req, timeout):
+    """打开 HTTP 请求；HTTP/网络错误统一转 RuntimeError（fetch_models 与 call_llm 共用）。"""
+    try:
+        return urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        raise RuntimeError("HTTP %s 错误: %s" % (e.code, _truncate(_decode_bytes(e.read())[0], 2000)))
+    except urllib.error.URLError as e:
+        raise RuntimeError("网络错误: %s" % e.reason)
+
+
 def fetch_models(opts):
     """请求 /models，返回接口支持的模型 id 列表（按接口原序）。"""
     url = opts["base_url"].rstrip("/") + "/models"
     req = urllib.request.Request(url, method="GET")
     if opts["api_key"]:
         req.add_header("Authorization", "Bearer " + opts["api_key"])
-    try:
-        resp = urllib.request.urlopen(req, timeout=opts["http_timeout"])
-    except urllib.error.HTTPError as e:
-        raise RuntimeError("HTTP %s 错误: %s" % (e.code, _truncate(_decode_bytes(e.read())[0], 2000)))
-    except urllib.error.URLError as e:
-        raise RuntimeError("网络错误: %s" % e.reason)
+    resp = _http_open(req, opts["http_timeout"])
     try:
         raw = resp.read(MAX_RESPONSE_BYTES + 1)
     except Exception as e:
@@ -1244,12 +1210,7 @@ def call_llm(messages, opts, on_delta=None):
     saw_sse = False
     usage = None
 
-    try:
-        resp = urllib.request.urlopen(req, timeout=opts["http_timeout"])
-    except urllib.error.HTTPError as e:
-        raise RuntimeError("HTTP %s 错误: %s" % (e.code, _truncate(_decode_bytes(e.read())[0], 2000)))
-    except urllib.error.URLError as e:
-        raise RuntimeError("网络错误: %s" % e.reason)
+    resp = _http_open(req, opts["http_timeout"])
     latency_ms = int((time.time() - _t0) * 1000)
 
     try:
@@ -1380,7 +1341,6 @@ def db_new_session(conn, opts):
         " cwd, host, pid, bo_version) VALUES(NULL, ?, 0, 'running', ?, ?, ?, ?, ?, ?)",
         (time.time(), opts["model"], opts["base_url"], opts["cwd"],
          platform.node(), os.getpid(), BO_VERSION))
-    conn.commit()
     sid = cur.lastrowid
     conn.execute("UPDATE sessions SET session_no=? WHERE id=?", (sid, sid))
     conn.commit()
@@ -1412,11 +1372,10 @@ def db_add_event(conn, session_id, step, kind, content="", role=None,
         (session_id, (row[0] or 0) + 1, time.time(), step, kind, role, content,
          tool_name, tool_call_id, tool_args, 1 if is_error else 0, latency_ms,
          tokens_prompt, tokens_completion))
-    conn.commit()
     if kind == "user" and content:
         conn.execute("UPDATE sessions SET title=? WHERE id=? AND title IS NULL",
                      (_first_line(content)[:60], session_id))
-        conn.commit()
+    conn.commit()
 
 
 def db_bump_tokens(conn, session_id, usage, latency_ms):
@@ -1533,55 +1492,41 @@ def db_load_session(conn, sid, system_prompt=None):
 
 
 
+def _pick(items, prompt):
+    """打印编号列表让用户选择，返回选中的 0 基下标；回车取消静默返回 None，其余无效输入有提示。"""
+    for i, it in enumerate(items):
+        sys.stdout.write("  [%d] %s\n" % (i + 1, it))
+    try:
+        choice = input(prompt).strip()
+    except (EOFError, KeyboardInterrupt):
+        sys.stdout.write("\n已取消。\n")
+        return None
+    if not choice:
+        return None
+    if choice.isdigit() and 1 <= int(choice) <= len(items):
+        return int(choice) - 1
+    sys.stdout.write("不是有效编号。\n")
+    return None
+
+
 def choose_session(conn):
     """交互式列出最近会话并让用户选择。返回选中的 session_id 或 None。"""
     rows = db_list_sessions(conn, 10)
     if not rows:
         sys.stdout.write("还没有历史会话。\n")
         return None
-    for sid, no, title, started, status in rows:
-        ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(started or 0))
-        label = (title or "(无标题)")
-        sys.stdout.write("  [%d] %s  %s  (%s)\n" % (sid, label[:40], ts, status))
-    try:
-        choice = input("载入哪个会话？输编号（回车取消）> ").strip()
-    except (EOFError, KeyboardInterrupt):
-        sys.stdout.write("\n已取消。\n")
-        return None
-    if not choice:
-        return None
-    try:
-        sid = int(choice)
-    except ValueError:
-        sys.stdout.write("不是有效编号。\n")
-        return None
-    if not any(r[0] == sid for r in rows):
-        sys.stdout.write("没有该会话。\n")
-        return None
-    return sid
+    items = ["%s  %s  (%s)" % ((title or "(无标题)")[:40],
+             time.strftime("%Y-%m-%d %H:%M", time.localtime(started or 0)), status)
+             for _sid, _no, title, started, status in rows]
+    idx = _pick(items, "载入哪个会话？输编号（回车取消）> ")
+    return rows[idx][0] if idx is not None else None
 
 
 def choose_model(opts):
     """列出接口支持的模型并让用户按编号选择。返回选中的模型名或 None。"""
     ids = fetch_models(opts)
-    for i, mid in enumerate(ids):
-        sys.stdout.write("  [%d] %s\n" % (i + 1, mid))
-    try:
-        choice = input("选择哪个模型？输编号（回车取消）> ").strip()
-    except (EOFError, KeyboardInterrupt):
-        sys.stdout.write("\n已取消。\n")
-        return None
-    if not choice:
-        return None
-    try:
-        idx = int(choice)
-    except ValueError:
-        sys.stdout.write("不是有效编号。\n")
-        return None
-    if idx < 1 or idx > len(ids):
-        sys.stdout.write("没有该模型。\n")
-        return None
-    return ids[idx - 1]
+    idx = _pick(ids, "选择哪个模型？输编号（回车取消）> ")
+    return ids[idx] if idx is not None else None
 
 
 # ---------------------------------------------------------------------------
@@ -1711,10 +1656,10 @@ def build_system_prompt(opts):
         "\n"
         "可用工具:\n%s\n"
         "\n"
-        "做法: 先 search 定位，再 read_file 看清片段，然后 write_file（整体写入给 content、"
-        "局部修改给 old_string + new_string），最后用 run_command 验证（跑测试/编译/执行脚本）；"
+        "做法: 先 search 定位，再 read_file 看清片段，然后 write_file（新建/整体覆盖给 content）"
+        "或 edit_file（局部修改给 old_string + new_string），最后用 run_command 验证（跑测试/编译/执行脚本）；"
         "不要凭空猜测。\n"
-        "新建文件一律用 write_file 的 content 模式，不要用 run_command 的 echo/cat 重定向拼文件；"
+        "新建文件一律用 write_file，不要用 run_command 的 echo/cat 重定向拼文件；"
         "删除或移动文件用 run_command 的 rm / mv，比较危险的操作先向用户确认。\n"
         "\n"
         "输出: 当前是纯文本终端，不渲染 Markdown。不要用加粗、标题、代码围栏等语法。回答用中文，简洁直接。\n"
@@ -1849,22 +1794,6 @@ def _drop_tool_calls_by_id(messages, ids):
                     continue                      # 纯坏调用、没正文，整条移除
         out.append(m)
     messages[:] = out
-
-
-def _close_dangling_tool_calls(messages, note):
-    """给缺结果的那批 tool_calls 补一条结果，保持消息历史合法。
-
-    中断/异常可能落在工具循环之外，此时 assistant 的 tool_calls 已入历史却没人应答，
-    下一次请求会被接口判为格式错误；这里统一补齐。返回补了几条。
-    """
-    answered = set(m.get("tool_call_id") for m in messages if m.get("role") == "tool")
-    for m in reversed(messages):
-        if m.get("role") == "assistant" and m.get("tool_calls"):
-            pending = [tc for tc in m["tool_calls"] if tc.get("id") not in answered]
-            for tc in pending:
-                messages.append({"role": "tool", "tool_call_id": tc.get("id"), "content": note})
-            return len(pending)
-    return 0
 
 
 def _close_tool_calls(messages):
@@ -2015,10 +1944,8 @@ def run_turn(user_text, messages, opts, out):
                 continue
 
             key = "%s|%s" % (name, raw_args)
-            if key == repeat["key"]:
-                repeat["n"] += 1
-            else:
-                repeat["key"], repeat["n"] = key, 1
+            repeat["n"] = repeat["n"] + 1 if key == repeat["key"] else 1
+            repeat["key"] = key
             if repeat["n"] >= MAX_REPEAT_CALLS:
                 aborted = True
                 abort_note = "错误: 本轮已因重复调用中止，本次调用未执行。"
@@ -2027,7 +1954,8 @@ def run_turn(user_text, messages, opts, out):
                           "请换一种思路，或直接说明结论。" % (name, repeat["n"]))
             else:
                 try:
-                    result = execute_tool(name, args, opts)
+                    func = TOOL_FUNCS.get(name)
+                    result = func(args, opts) if func else "错误: 未知工具 %s" % name
                 except TurnInterrupted:
                     # 工具执行到一半被打断：结果不可信，也不继续跑后续调用
                     result = ("错误: 用户按 Ctrl+C 中断了本轮，本次调用未正常结束，"
@@ -2139,11 +2067,9 @@ def parse_args():
         try:
             chosen = choose_model({"base_url": base_url, "api_key": api_key,
                                    "http_timeout": http_timeout})
-        except RuntimeError as e:
-            sys.stderr.write("获取模型清单失败: %s\n" % e)
-            sys.exit(1)
         except Exception as e:
-            sys.stderr.write("获取模型清单失败: %s: %s\n" % (type(e).__name__, e))
+            msg = str(e) if isinstance(e, RuntimeError) else "%s: %s" % (type(e).__name__, e)
+            sys.stderr.write("获取模型清单失败: %s\n" % msg)
             sys.exit(1)
         if chosen is None:
             sys.stdout.write("未切换模型。\n")
@@ -2177,18 +2103,11 @@ def setup_stdio():
         stream = getattr(sys, name, None)
         if stream is None:
             continue
-        reconfigure = getattr(stream, "reconfigure", None)
-        if reconfigure is not None:
-            try:
-                reconfigure(encoding="utf-8", errors="replace")
-                continue
-            except Exception:
-                pass
-        buf = getattr(stream, "buffer", None)
-        if buf is None:
-            continue
         try:
-            setattr(sys, name, io.TextIOWrapper(buf, encoding="utf-8", errors="replace"))
+            if hasattr(stream, "reconfigure"):          # Python 3.7+
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            elif getattr(stream, "buffer", None) is not None:   # 3.6：包一层 TextIOWrapper
+                setattr(sys, name, io.TextIOWrapper(stream.buffer, encoding="utf-8", errors="replace"))
         except Exception:
             pass
 
@@ -2265,12 +2184,10 @@ def main():
                 if sid is not None:
                     loaded = load_history(out.conn, sid, system_prompt)
                     if loaded:
-                        # 先收尾当前会话与本次新建的空壳，再切回被载入会话续写
+                        # 收尾当前会话，再切回被载入会话续写
                         prev = out.session_id
-                        _new_session(opts, out)
-                        db_close_session(out.conn, out.session_id, "closed")
-                        out.session_id = sid
-                        out.step = 0
+                        db_close_session(out.conn, prev, "closed")
+                        out.session_id, out.step = sid, 0
                         db_close_session(out.conn, sid, "running")
                         if prev != sid:
                             out.log("RESET", "已载入会话 #%d（%d 条消息），当前会话 #%d 已收尾"
@@ -2296,8 +2213,7 @@ def main():
                 sys.stdout.write("\n再见。\n")
                 break
             except TurnInterrupted:     # 兜底：中断落在生成/工具循环之外
-                _close_dangling_tool_calls(
-                    messages, "错误: 本轮已被 Ctrl+C 中断，本次调用未执行。")
+                _close_tool_calls(messages)
                 out.info("\n[已中断本轮；再按一次 Ctrl+C 退出程序]")
             except RuntimeError as e:
                 out.log("ERROR", str(e))
