@@ -71,7 +71,7 @@ MAX_EDITS = 50                       # max entries in the edit_file edits array 
 MAX_COMMAND_TIMEOUT = 3600           # run_command timeout limit (seconds)
 MAX_COMMAND_OUTPUT_BYTES = 256 * 1024  # max output run_command keeps in memory (half at each end, then truncated to the visible length)
 MAX_DIR_ITEMS = 1000                 # max items displayed at once when read_file lists a directory
-MAX_REPEAT_CALLS = 3                 # number of consecutive equivalent tool calls in one turn that aborts the turn
+REPEAT_WARN_CALLS = 3                # from this many consecutive equivalent tool calls in one turn, every result carries a guard note back to the model
 TRIM_KEEP_ROUNDS = 2                 # keep the complete tool round-trips of the most recent rounds of user input in the history, remove earlier ones
 SEARCH_SKIP_DIRS = (".git", "__pycache__", "node_modules", ".venv", "venv",
                     ".tox", ".mypy_cache", ".pytest_cache")  # directories skipped by search
@@ -1929,13 +1929,24 @@ def run_turn(user_text, messages, opts, out):
             key = _repeat_key(name, args)
             repeat["n"] = repeat["n"] + 1 if key == repeat["key"] else 1
             repeat["key"] = key
-            if repeat["n"] >= MAX_REPEAT_CALLS:
-                aborted = True
-                abort_note = "Error: this turn was aborted due to repeated calls, this call did not execute."
-                abort_info = "detected %d consecutive equivalent calls, this turn was stopped" % MAX_REPEAT_CALLS
-                result = ("Error: the equivalent %s call has appeared %d times in a row, this turn was aborted and this call did not execute."
-                          "That file/command has already been run; use the result you already have, or try a different approach."
-                          % (name, repeat["n"]))
+            if repeat["n"] >= REPEAT_WARN_CALLS:
+                # warning only, never abort: this call still runs, and the "stop repeating" note goes back to the model
+                # together with the result so the model can change its mind; endless repeats still never kill the session
+                # (it waits for the user or the model to converge).
+                try:
+                    func = TOOL_FUNCS.get(name)
+                    result = func(args, opts) if func else "Error: unknown tool %s" % name
+                except TurnInterrupted:
+                    result = ("Error: the user interrupted this turn with Ctrl+C, this call did not finish properly;"
+                              " do not keep calling tools, wait for the user's next instruction.")
+                    aborted = True
+                    abort_note = "Error: this turn was interrupted by Ctrl+C, this call did not execute."
+                    abort_info = "this turn was interrupted (Ctrl+C); press Ctrl+C again to quit the program"
+                # the guard note goes after the result: it must not hide the start of the real result (_is_error only reads the start)
+                result = result + ("\nWarning: the equivalent %s call has appeared %d times in a row; this call still ran, but do not repeat it."
+                                   "\n[repeat-call guard] that file/command already ran this turn and the result is in the conversation above;"
+                                   " do not call %s again with the same arguments. Continue with the result you already have, or try a different"
+                                   " approach (different arguments do not count as a repeat)." % (name, repeat["n"], name))
             else:
                 try:
                     func = TOOL_FUNCS.get(name)

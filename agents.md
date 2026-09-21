@@ -199,7 +199,10 @@ rm/mv，不加 delete_file/move_file。
 
 ## 重复调用护栏
 
-- `MAX_REPEAT_CALLS = 3`：同一轮内**等价**的调用连续出现 3 次即中止本轮。
+- 只提醒不中止：同一轮内**等价**的调用连续出现 `REPEAT_WARN_CALLS = 3` 次起，每次都**照常执行**，
+  只在结果后追加一段 `[重复调用护栏]` 说明（提示该调用本轮已执行过、别再重复、换参数不算重复、
+  请改用已有结果或换思路）回喂给模型，让它自己改主意；**不再有任何硬中止阈值**，重复再多也不掐断会话。
+  说明**拼在结果之后**，避免掩盖真实结果开头（`_is_error` 只看开头）。
 - `_repeat_key(name, args)` 做归一化，**不比对 raw_args 字符串**（否则改个 offset/timeout 就绕过）：
   文件类工具取「工具名 + realpath 路径」；`search` 取「pattern+path+glob」；`run_command` 取命令主体
   （忽略 cwd/timeout）；其它回落参数 JSON 稳定序列化。参数非 dict 也不抛异常。

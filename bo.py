@@ -71,7 +71,7 @@ MAX_EDITS = 50                       # write_file 单次 edits 数组最多条�
 MAX_COMMAND_TIMEOUT = 3600           # run_command 超时上限（秒）
 MAX_COMMAND_OUTPUT_BYTES = 256 * 1024  # run_command 在内存保留的输出上限（首尾各半，再截到可见长度）
 MAX_DIR_ITEMS = 1000                 # read_file 列目录时单次最多显示的项目数
-MAX_REPEAT_CALLS = 3                 # 同一轮内等价的工具调用连续出现该次数即中止本轮
+REPEAT_WARN_CALLS = 3                # 同一轮内等价的工具调用连续出现该次数起，每次结果都附护栏说明回喂给模型
 TRIM_KEEP_ROUNDS = 2                 # 历史里保留最近几轮用户输入的完整工具往返，更早的移除
 SEARCH_SKIP_DIRS = (".git", "__pycache__", "node_modules", ".venv", "venv",
                     ".tox", ".mypy_cache", ".pytest_cache")  # search 跳过的目录
@@ -1925,13 +1925,23 @@ def run_turn(user_text, messages, opts, out):
             key = _repeat_key(name, args)
             repeat["n"] = repeat["n"] + 1 if key == repeat["key"] else 1
             repeat["key"] = key
-            if repeat["n"] >= MAX_REPEAT_CALLS:
-                aborted = True
-                abort_note = "错误: 本轮已因重复调用中止，本次调用未执行。"
-                abort_info = "检测到连续 %d 次等价的调用，已停止本轮" % MAX_REPEAT_CALLS
-                result = ("错误: 等价的 %s 调用已连续出现 %d 次，已中止本轮，本次调用未执行。"
-                          "该文件/命令此前已执行过，请直接使用已有结果，或换一种思路。"
-                          % (name, repeat["n"]))
+            if repeat["n"] >= REPEAT_WARN_CALLS:
+                # 只提醒不中止：当次照常执行，把「别再重复」的说明连同结果一起回喂给模型，
+                # 让模型自己改主意；真的一直重复也不掐断会话（等用户或模型自行收敛）。
+                try:
+                    func = TOOL_FUNCS.get(name)
+                    result = func(args, opts) if func else "错误: 未知工具 %s" % name
+                except TurnInterrupted:
+                    result = ("错误: 用户按 Ctrl+C 中断了本轮，本次调用未正常结束，"
+                              "请勿继续调用工具，等待用户下一步指示。")
+                    aborted = True
+                    abort_note = "错误: 本轮已被 Ctrl+C 中断，本次调用未执行。"
+                    abort_info = "已中断本轮（Ctrl+C），再按一次 Ctrl+C 退出程序"
+                # 护栏说明放结果之后：不让它掩盖真实结果的开头（_is_error 只看开头）
+                result = result + ("\n警告: 等价的 %s 调用已连续出现 %d 次，本次仍照常执行，但请勿再重复。"
+                                   "\n[重复调用护栏] 该文件/命令本轮已执行过且结果就在上面的对话里，"
+                                   "不要再用相同参数调用 %s。请改用已有结果继续，或换一种思路"
+                                   "（换参数不算重复）。" % (name, repeat["n"], name))
             else:
                 try:
                     func = TOOL_FUNCS.get(name)
