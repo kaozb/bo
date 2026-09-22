@@ -10,7 +10,7 @@
     export OPENAI_BASE_URL=https://api.deepseek.com/v1
     export OPENAI_API_KEY=sk-xxxx
     export MODEL=deepseek-chat
-    python BO.py
+    python bo.py
 
 参数:
     -m, --model NAME    模型名（覆盖 MODEL / OPENAI_MODEL）
@@ -64,10 +64,11 @@ MAX_OUTPUT_CHARS = 30000             # 单个工具结果进入上下文的最�
 MAX_LINE_CHARS = 2000                # read_file 单行最大显示字符数
 MAX_READ_BYTES = 3 * 1024 * 1024     # 文件读写大小上限，超过一律拒绝（防止内存被撑爆）
 MAX_READ_MB = MAX_READ_BYTES // 1048576  # 上限的 MB 数值，供提示文案复用
+MAX_READ_LINES = 100000              # read_file 单次最多读取行数（limit 上限）
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024  # 单次 HTTP 响应大小上限
 MAX_SEARCH_FILE_BYTES = 2 * 1024 * 1024  # search 单文件最大读取字节数
 MAX_SEARCH_RESULTS = 1000            # search 单次最多返回的结果行数
-MAX_EDITS = 50                       # write_file 单次 edits 数组最多条数
+MAX_EDITS = 50                       # edit_file 单次 edits 数组最多条数
 MAX_COMMAND_TIMEOUT = 3600           # run_command 超时上限（秒）
 MAX_COMMAND_OUTPUT_BYTES = 256 * 1024  # run_command 在内存保留的输出上限（首尾各半，再截到可见长度）
 MAX_DIR_ITEMS = 1000                 # read_file 列目录时单次最多显示的项目数
@@ -143,14 +144,15 @@ def _arr(desc, item_props, item_required):
 
 
 TOOLS = [
-    _fn("read_file", "读取文件（带行号）或列出目录，offset 从 1 开始、未读完会给出续读 offset，"
+    _fn("read_file", "读取文件（带行号）或列出目录，start_line 从 1 开始、未读完会给出续读 start_line，"
         "二进制文件拒绝读取。输出每行带「行号+Tab」前缀，复制给 edit_file 的 old_string 时必须去掉。",
         {"path": _p("string", "文件或目录路径（相对或绝对）"),
-         "offset": _p("integer", "起始行号 / 起始项目，从 1 开始，默认 1"),
-         "limit": _p("integer", "文件最多读取行数（默认 2000）/ 目录最多列出项数（默认 200）")},
+         "start_line": _p("integer", "起始行号 / 起始项目，从 1 开始，默认 1"),
+         "limit": _p("integer", "读文件时必填：本次最多读取行数（需自己估算）/ 目录最多列出项数（默认 200）")},
         ["path"]),
     _fn("write_file", "新建文件或整体覆盖已有文件：给 path + content。content 是文件的完整最终内容，"
-        "不能为空；父目录不存在会自动创建。只改局部不要用本工具，改用 edit_file。",
+        "不能为空；父目录不存在会自动创建。只改局部不要用本工具，改用 edit_file。"
+        "新建空文件请用 run_command 的 touch，不要用 shell 重定向拼文件。",
         {"path": _p("string", "文件路径"),
          "content": _p("string", "文件的完整最终内容（不能为空）")},
         ["path", "content"]),
@@ -175,8 +177,8 @@ TOOLS = [
         {"pattern": _p("string", "正则表达式；不是合法正则时自动按字面量搜索"),
          "path": _p("string", "要搜索的文件或目录，默认当前目录 ."),
          "glob": _p("string", "只搜索匹配该通配符的文件（如 *.py），默认全部"),
-         "max_results": _p("integer", "最多返回的命中行数，默认 100，上限 1000（上下文行不计入；输出另有 30000 字符上限）"),
-         "context_lines": _p("integer", "每条命中附加上下各 N 行（0-10），默认 0")},
+         "max_results": _p("integer", "最多返回的命中行数，默认 100，上限 1000（上下文行不计入；输出另有 30000 字符上限）。非法或越界时回落到默认值"),
+         "context_lines": _p("integer", "每条命中附加上下各 N 行（0-10），默认 0；非法或越界时回落到 0")},
         ["pattern"]),
     _fn("run_command", "在 shell 中执行命令，返回退出码与合并后的 stdout+stderr。"
         "命令的 stdin 是空的，不要执行 vim / top 等交互式命令；输出过大时只保留首尾并提示截断。",
@@ -227,7 +229,7 @@ def _truncate(text, limit=MAX_OUTPUT_CHARS, note=None):
     if len(text) <= limit:
         return text
     note = note or "\n... [已截断，原文共 %d 字符]"
-    return text[:limit] + (note % len(text) if "%d" in note else note)
+    return text[:limit] + (note.replace("%d", str(len(text))) if "%d" in note else note)
 
 
 def _indent(text, prefix="    ", limit=MAX_OUTPUT_CHARS):
@@ -347,8 +349,8 @@ def _atomic_write(path, data, mode=None):
         raise
 
 
-def _read_lines_window(path, shown, offset, limit):
-    """按行窗口读取文件，返回 (行列表, 总行数, 错误)；offset 为 0 基。
+def _read_lines_window(path, shown, start, limit):
+    """按行窗口读取文件，返回 (行列表, 总行数, 错误)；start 为 0 基。
 
     整份读入后用 _decode_bytes 探测编码（utf-8 → gbk → latin-1，GBK 等也能正确读出）。
     超过 MAX_READ_BYTES 的文件由 _read_file_bytes 直接拒绝，不再走流式扫描，
@@ -360,11 +362,11 @@ def _read_lines_window(path, shown, offset, limit):
     if b"\x00" in raw[:8192]:
         return None, 0, _binary_error(shown)
     lines = _split_lines(_decode_bytes(raw)[0])
-    return lines[offset:offset + limit], len(lines), None
+    return lines[start:start + limit], len(lines), None
 
 
-def _list_dir(real, shown, offset=0, limit=200):
-    """列出目录内容（read_file 传入目录时使用）；只列一层，支持 offset/limit 翻项。"""
+def _list_dir(real, shown, start=0, limit=200):
+    """列出目录内容（read_file 传入目录时使用）；只列一层，支持 start/limit 翻项。"""
     try:
         with os.scandir(real) as it:
             entries = sorted(it, key=lambda e: e.name)
@@ -388,16 +390,16 @@ def _list_dir(real, shown, offset=0, limit=200):
     items = dirs + links + files + others
     if not items:
         return "目录 %s 为空。" % shown
-    window = items[offset:offset + limit]
+    window = items[start:start + limit]
     if not window:
-        return "目录 %s 共 %d 项，offset=%d 已超出末尾。" % (shown, len(items), offset + 1)
+        return "目录 %s 共 %d 项，start_line=%d 已超出末尾。" % (shown, len(items), start + 1)
     note = ""
-    if offset + len(window) < len(items):
-        note = "\n... [还有 %d 项，续看 offset=%d]" % (
-            len(items) - offset - len(window), offset + len(window) + 1)
+    if start + len(window) < len(items):
+        note = "\n... [还有 %d 项，续看 start_line=%d]" % (
+            len(items) - start - len(window), start + len(window) + 1)
     return "目录 %s 共 %d 项（目录 %d / 文件 %d），显示第 %d-%d 项:\n%s%s" % (
         shown, len(items), len(dirs), len(files),
-        offset + 1, offset + len(window), "\n".join(window), note)
+        start + 1, start + len(window), "\n".join(window), note)
 
 
 def find_agent_file():
@@ -515,19 +517,34 @@ def tool_read_file(args, opts):
     if not shown:
         return "错误: 缺少 path 参数"
     path = os.path.realpath(shown)
-    offset = max(_int(args.get("offset"), 1, minimum=1) - 1, 0)  # 对外 1 基，内部 0 基
+    start = max(_int(args.get("start_line"), 1, minimum=1) - 1, 0)  # 对外 1 基，内部 0 基
     if os.path.isdir(path):
-        return _list_dir(path, shown, offset,
+        return _list_dir(path, shown, start,
                          min(_int(args.get("limit"), 200, minimum=1), MAX_DIR_ITEMS))
 
-    limit = _int(args.get("limit"), 2000, minimum=1)
-    lines, total, err = _read_lines_window(path, shown, offset, limit)
+    raw_limit = args.get("limit")
+    if raw_limit is None:
+        return ("错误: 读文件必须显式给 limit（本次最多读取的行数），"
+                "请根据文件规模自行估算，不要省略；需要通读可给一个大到足够的值，"
+                "必要时用 start_line 续读。")
+    try:
+        limit = int(raw_limit)
+    except Exception:
+        return ("错误: limit 必须是正整数（本次最多读取的行数），"
+                "收到的是 %r；请重新调用并给出一个正整数。" % (raw_limit,))
+    if limit < 1:
+        return ("错误: limit 必须不小于 1（本次最多读取的行数），收到的是 %d；"
+                "请重新调用并给出正整数。" % limit)
+    if limit > MAX_READ_LINES:
+        return ("错误: limit 超出单次上限（最多 %d 行），收到的是 %d；"
+                "请调小后重试，需要更多内容用 start_line 分批续读。" % (MAX_READ_LINES, limit))
+    lines, total, err = _read_lines_window(path, shown, start, limit)
     if err:
         return err
     if total == 0:
         return "文件 %s 是空文件。" % shown
-    if offset >= total:
-        return "文件 %s 共 %d 行，offset=%d 已超出文件末尾。" % (shown, total, offset + 1)
+    if start >= total:
+        return "文件 %s 共 %d 行，start_line=%d 已超出文件末尾。" % (shown, total, start + 1)
 
     # 逐行拼装并累计字符数：即使 limit 很大，单次输出也不会超出上下文预算
     shown_lines, used, cut = [], 0, False
@@ -537,17 +554,19 @@ def tool_read_file(args, opts):
         if shown_lines and used + cost > MAX_OUTPUT_CHARS:
             cut = True
             break
-        shown_lines.append("%6d\t%s" % (offset + i + 1, text))
+        shown_lines.append("%6d\t%s" % (start + i + 1, text))
         used += cost
-    end = offset + len(shown_lines)
-    header = "文件 %s 共 %d 行，显示第 %d-%d 行:" % (shown, total, offset + 1, end)
+    end = start + len(shown_lines)
+    header = "文件 %s 共 %d 行，显示第 %d-%d 行，剩余 %d 行:" % (
+        shown, total, start + 1, end, max(0, total - end))
     if end >= total:
-        footer = "\n[已到文件末尾]"
+        footer = "\n[已到文件末尾，剩余 0 行]"
     elif cut:
-        footer = "\n[输出已达 %d 字符上限，本次显示到第 %d 行；续读 offset=%d]" % (
-            MAX_OUTPUT_CHARS, end, end + 1)
+        footer = "\n[输出已达 %d 字符上限，本次显示到第 %d 行，剩余 %d 行；续读 start_line=%d]" % (
+            MAX_OUTPUT_CHARS, end, total - end, end + 1)
     else:
-        footer = "\n[还有 %d 行未显示，续读 offset=%d]" % (total - end, end + 1)
+        footer = "\n[还有 %d 行未显示（剩余 %d 行），续读 start_line=%d]" % (
+            total - end, total - end, end + 1)
     return header + "\n" + "\n".join(shown_lines) + footer
 
 
@@ -580,7 +599,11 @@ def _write_whole_file(path, shown, args):
     """模式一：整体写入（新建或覆盖）。"""
     content = args.get("content")
     if not isinstance(content, str):
-        content = json.dumps(content, ensure_ascii=False, indent=2)
+        # 非字符串（数字/对象/数组等）按 JSON 文本写入，但必须是 JSON 类型而不是非法值
+        try:
+            content = json.dumps(content, ensure_ascii=False, indent=2)
+        except (TypeError, ValueError):
+            return "错误: content 必须是字符串类型的文件内容。"
     if content == "":
         return ("错误: content 为空，会清空文件，已拒绝写入。新建空文件请用 run_command 的 touch；"
                 "确实要清空已有文件请显式执行 `: > 文件`。")
@@ -591,8 +614,7 @@ def _write_whole_file(path, shown, args):
     enc, old_lines, old_bytes = "utf-8", 0, 0
     if existed:
         if os.path.getsize(path) > MAX_READ_BYTES:
-            return "错误: 目标文件过大（> %d MB），拒绝整体覆盖；请改用 edit_file 局部修改" % (
-                MAX_READ_BYTES // 1048576)
+            return "错误: 目标文件过大（> %d MB），拒绝整体覆盖；请改用 edit_file 局部修改" % MAX_READ_MB
         raw, err = _read_file_bytes(path)
         if err:
             return err
@@ -607,7 +629,7 @@ def _write_whole_file(path, shown, args):
         enc, data = "utf-8", content.encode("utf-8")
     if len(data) > MAX_READ_BYTES:
         return "错误: 写入内容过大（%.1f MB，上限 %d MB）" % (
-            len(data) / 1048576.0, MAX_READ_BYTES // 1048576)
+            len(data) / 1048576.0, MAX_READ_MB)
 
     parent = os.path.dirname(path)
     if parent and not os.path.isdir(parent):
@@ -1607,7 +1629,9 @@ class Output(object):
 
     def tool_call(self, name, raw_args):
         if self.level >= LEVEL_NORMAL:
-            self._w(self._c("  · %s(%s)" % (name or "?", _brief(raw_args or "{}")), self.DIM) + "\n")
+            # run_command 不折叠：命令被截断后看不到参数，长命令尤其需要逐字可见
+            brief = raw_args if name == "run_command" else _brief(raw_args or "{}")
+            self._w(self._c("  · %s(%s)" % (name or "?", brief or "{}"), self.DIM) + "\n")
 
     def tool_result(self, result, is_error):
         if self.level >= LEVEL_VERBOSE:
@@ -1640,10 +1664,11 @@ def build_system_prompt(opts):
         "\n"
         "可用工具:\n%s\n"
         "\n"
-        "做法: 先 search 定位，再 read_file 看清片段，然后 write_file（新建/整体覆盖给 content）"
+        "做法: 先 search 定位，再 read_file 看清片段（必须自行指定 limit，不要依赖默认值），"
+        "然后 write_file（新建/整体覆盖给 content）"
         "或 edit_file（局部修改给 old_string + new_string），最后用 run_command 验证（跑测试/编译/执行脚本）；"
         "不要凭空猜测。\n"
-        "新建文件一律用 write_file，不要用 run_command 的 echo/cat 重定向拼文件；"
+        "新建文件一律用 write_file，不要用 run_command 的 echo/cat 重定向拼文件（空文件用 touch 即可）；"
         "删除或移动文件用 run_command 的 rm / mv，比较危险的操作先向用户确认。\n"
         "\n"
         "输出: 当前是纯文本终端，不渲染 Markdown。不要用加粗、标题、代码围栏等语法。回答用中文，简洁直接。\n"
@@ -1711,7 +1736,7 @@ def _trim_history(messages, keep_rounds=TRIM_KEEP_ROUNDS):
 def _repeat_key(name, args):
     """把一次工具调用归一化成「等价判定」用的 key，供重复调用护栏使用。
 
-    直接拿 raw_args 字符串比对太脆：read_file 的 offset 挪一格、run_command 的
+    直接拿 raw_args 字符串比对太脆：read_file 的 start_line 挪一格、run_command 的
     timeout 改一改都会被当成「新调用」，同一文件/同一命令实际被反复执行。这里按
     工具的语义只取「实质参数」：
       - 文件类（read_file / write_file / edit_file）: 工具名 + 规范化后的路径；
@@ -1863,13 +1888,13 @@ def run_turn(user_text, messages, opts, out):
         reasoning = msg.get("reasoning_content") or msg.get("reasoning") or ""
         tool_calls = msg.get("tool_calls") or []
 
-        # 内容已在流式阶段实时打印，这里只补写日志（quiet 级别下思考被跳过，正文最终答复见下）
+        # 内容已在流式阶段实时打印（quiet 级别下正文不实时打印），这里只补写日志
         if reasoning:
             out.log("THINKING", reasoning.strip())
         if content:
             out.log("ASSISTANT", content)
         db_bump_tokens(out.conn, out.session_id, msg.get("_usage"), msg.get("_latency_ms"))
-        # content 为空但 quiet 级别下未打印过任何正文时，兜底显示
+        # quiet 级别下正文没在流式阶段打印，这里以最终答复的形式补显示一次
         if content and out.level == LEVEL_QUIET and not tool_calls:
             out.assistant(content, True)
 
@@ -1925,34 +1950,24 @@ def run_turn(user_text, messages, opts, out):
             key = _repeat_key(name, args)
             repeat["n"] = repeat["n"] + 1 if key == repeat["key"] else 1
             repeat["key"] = key
+            try:
+                func = TOOL_FUNCS.get(name)
+                result = func(args, opts) if func else "错误: 未知工具 %s" % name
+            except TurnInterrupted:
+                # 工具执行到一半被打断：结果不可信，也不继续跑后续调用
+                result = ("错误: 用户按 Ctrl+C 中断了本轮，本次调用未正常结束，"
+                          "请勿继续调用工具，等待用户下一步指示。")
+                aborted = True
+                abort_note = "错误: 本轮已被 Ctrl+C 中断，本次调用未执行。"
+                abort_info = "已中断本轮（Ctrl+C），再按一次 Ctrl+C 退出程序"
             if repeat["n"] >= REPEAT_WARN_CALLS:
                 # 只提醒不中止：当次照常执行，把「别再重复」的说明连同结果一起回喂给模型，
                 # 让模型自己改主意；真的一直重复也不掐断会话（等用户或模型自行收敛）。
-                try:
-                    func = TOOL_FUNCS.get(name)
-                    result = func(args, opts) if func else "错误: 未知工具 %s" % name
-                except TurnInterrupted:
-                    result = ("错误: 用户按 Ctrl+C 中断了本轮，本次调用未正常结束，"
-                              "请勿继续调用工具，等待用户下一步指示。")
-                    aborted = True
-                    abort_note = "错误: 本轮已被 Ctrl+C 中断，本次调用未执行。"
-                    abort_info = "已中断本轮（Ctrl+C），再按一次 Ctrl+C 退出程序"
                 # 护栏说明放结果之后：不让它掩盖真实结果的开头（_is_error 只看开头）
                 result = result + ("\n警告: 等价的 %s 调用已连续出现 %d 次，本次仍照常执行，但请勿再重复。"
                                    "\n[重复调用护栏] 该文件/命令本轮已执行过且结果就在上面的对话里，"
                                    "不要再用相同参数调用 %s。请改用已有结果继续，或换一种思路"
                                    "（换参数不算重复）。" % (name, repeat["n"], name))
-            else:
-                try:
-                    func = TOOL_FUNCS.get(name)
-                    result = func(args, opts) if func else "错误: 未知工具 %s" % name
-                except TurnInterrupted:
-                    # 工具执行到一半被打断：结果不可信，也不继续跑后续调用
-                    result = ("错误: 用户按 Ctrl+C 中断了本轮，本次调用未正常结束，"
-                              "请勿继续调用工具，等待用户下一步指示。")
-                    aborted = True
-                    abort_note = "错误: 本轮已被 Ctrl+C 中断，本次调用未执行。"
-                    abort_info = "已中断本轮（Ctrl+C），再按一次 Ctrl+C 退出程序"
 
             out.log("TOOL_RESULT " + (name or "?"), result, tool_call_id=tc.get("id"))
             out.tool_result(result, _is_error(result))

@@ -43,7 +43,7 @@ python3 bo_en.py     # 英文版
 你 > 看看 bo.py 用了哪些标准库，然后写进 README 的"特性"一节
 
   · search({"pattern": "^import ", "path": "bo.py"})
-  · read_file({"path": "bo.py", "offset": 1, "limit": 60})
+  · read_file({"path": "bo.py", "start_line": 1, "limit": 60})
   · edit_file({"path": "README.md", "old_string": "- 三个工具：...", "new_string": "- 四个工具：..."})
   ... 中间的工具调用与思考过程 ...
 
@@ -87,7 +87,7 @@ python3 bo_en.py -y -v -d ~/sessions/my.db -m deepseek-chat
 
 | 工具 | 说明 |
 | :--- | :--- |
-| `read_file` | 读取文件，返回带行号内容；`offset` 从 1 开始，读到中途会提示续读位置；传目录则列出目录内容（支持 `offset` / `limit` 翻项）。超过 3 MB 的文件拒绝读取（请用 `run_command` 的 `head` / `tail` / `sed`）；二进制文件拒绝读取 |
+| `read_file` | 读取文件，返回带行号内容；`start_line` 从 1 开始，返回里标明「显示第 A-B 行、剩余 R 行」并提示续读位置；传目录则列出目录内容（支持 `start_line` / `limit` 翻项）。超过 3 MB 的文件拒绝读取（请用 `run_command` 的 `head` / `tail` / `sed`）；二进制文件拒绝读取 |
 | `write_file` | 新建或整体覆盖文件：给 `content`，父目录自动创建（新建文件请用它，不要用 shell 重定向）。整体写入受 3 MB 上限约束；新内容比原文件小很多时会提示，防止误覆盖 |
 | `edit_file` | 在已有文件中精确替换：`old_string` + `new_string`，或 `edits` 一次提交多处（按顺序应用，任一失败则整单不写入）；`replace_all` 替换全部出现位置。`old_string` 需在文件中唯一，失败时列出最接近的行，并可忽略行尾空白 / CRLF 差异；替换成功返回 diff |
 | `search` | 用正则搜索文件或目录，返回 `文件:行号:匹配行`，支持 `glob`、`max_results`、`context_lines` |
@@ -152,7 +152,7 @@ On startup the agent prints the model, endpoint and display level, then enters a
 you > check which standard-library modules bo.py uses, then add them to the Features section of the README
 
   · search({"pattern": "^import ", "path": "bo.py"})
-  · read_file({"path": "bo.py", "offset": 1, "limit": 60})
+  · read_file({"path": "bo.py", "start_line": 1, "limit": 60})
   · edit_file({"path": "README.md", "old_string": "- Three tools: ...", "new_string": "- Four tools: ..."})
   ... tool calls and reasoning in between ...
 
@@ -196,7 +196,7 @@ Precedence: **command line > environment variable > `.bo` > built-in default**. 
 
 | Tool | Description |
 | :--- | :--- |
-| `read_file` | read a file with line numbers; `offset` is 1-based and a continuation offset is reported; pass a directory to list it (with `offset` / `limit` paging). Files over 3 MB are refused (use `head` / `tail` / `sed` through `run_command`); binary files are refused |
+| `read_file` | read a file with line numbers; `start_line` is 1-based and a continuation start_line is reported; pass a directory to list it (with `start_line` / `limit` paging). Files over 3 MB are refused (use `head` / `tail` / `sed` through `run_command`); binary files are refused |
 | `write_file` | create a new file or overwrite an existing one: give `content`, parent directories are created automatically (use this for new files, not shell redirection). Whole-file writes obey the 3 MB cap; a much smaller new content triggers a warning against accidental overwrites |
 | `edit_file` | exact replacement in an existing file: `old_string` + `new_string`, or `edits` to submit several changes at once (applied in order; if any fails the whole batch is not written); `replace_all` replaces every occurrence. `old_string` must be unique in the file; failures list the closest lines and trailing-whitespace/CRLF differences may be ignored; a successful replacement returns a diff |
 | `search` | regex search across a file or directory, returning `file:line:match`, with `glob`, `max_results` and `context_lines` |

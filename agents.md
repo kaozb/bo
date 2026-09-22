@@ -89,7 +89,7 @@
 
 BO 是单文件、纯标准库的最小编码智能体，走 OpenAI 兼容接口（`/v1/chat/completions`），5 个工具：
 
-- `read_file`   读文件（带行号、offset/limit 续读）/ 列目录
+- `read_file`   读文件（带行号、start_line/limit 续读）/ 列目录
 - `write_file`  整体写入：`path` + `content`（新建或整体覆盖）。父目录自动创建，空 content 拒绝。
 - `edit_file`   局部修改：`path` + `old_string`/`new_string`（或 `edits` 批量）。三级降级定位。
 - `search`      正则搜索（整文件预筛 + 逐行匹配）
@@ -169,11 +169,14 @@ rm/mv，不加 delete_file/move_file。
   <4 字符放弃防误伤）。
 - **`_read_lines_window` 整读 + `_decode_bytes` 探测编码**（utf-8→gbk→latin-1）。没有流式扫描分支，
   因此不存在「小文件正常、大文件乱码」的双路径不一致。
-- **`MAX_READ_BYTES = 3MB`**：read_file 读取与 write_file 整体写入的上限，超限一律拒绝并提示改用
+- `read_file` 读文件时 **`limit` 必填且严格校验**（不经 `_int` 静默回落）：缺失、非整数、<1、>MAX_READ_LINES(100000)
+  都直接返回错误字符串提示模型重试；目录列举仍默认 200、仍走 `_int`。超长/大文件靠 start_line 续读。**`MAX_READ_BYTES = 3MB`**：read_file 读取与 write_file 整体写入的上限，超限一律拒绝并提示改用
   `run_command` 配合 head/tail/sed；`MAX_READ_MB` 供提示文案复用。
 - **`_list_dir` 用 `os.scandir`**；**行切分统一走 `_split_lines`**（只按 `\n` 断行、去行尾 `\r`、
   忽略末尾空行），因此 `\x0b`/`\x0c`/`\x85`/`\u2028` 不当行分隔，行号与编辑器一致。
-- **超长行截断带原长**：`read_file` 与 `search` 的 `_truncate` note 为 `"... [本行已截断，原 %d 字符]"`。
+- **超长行截断带原长**：`read_file` 与 `search` 的 `_truncate` note 为 `"... [本行已截断，原 %d 字符]"`；
+  `_truncate` 用 `str.replace("%d", ...)` 而不是 `%` 格式化，note 里出现其它 `%` 也不会报错。
+- **`read_file` 返回带剩余行数**：头部写「显示第 A-B 行，剩余 R 行」，footer 对应写「剩余 R 行」/「还有 R 行未显示（剩余 R 行）」；R = 总行数 - 已显示末行。目录列举不含剩余行数。
 
 有意为之的行为（勿当 bug 改回）：
 
@@ -203,7 +206,7 @@ rm/mv，不加 delete_file/move_file。
   只在结果后追加一段 `[重复调用护栏]` 说明（提示该调用本轮已执行过、别再重复、换参数不算重复、
   请改用已有结果或换思路）回喂给模型，让它自己改主意；**不再有任何硬中止阈值**，重复再多也不掐断会话。
   说明**拼在结果之后**，避免掩盖真实结果开头（`_is_error` 只看开头）。
-- `_repeat_key(name, args)` 做归一化，**不比对 raw_args 字符串**（否则改个 offset/timeout 就绕过）：
+- `_repeat_key(name, args)` 做归一化，**不比对 raw_args 字符串**（否则改个 start_line/timeout 就绕过）：
   文件类工具取「工具名 + realpath 路径」；`search` 取「pattern+path+glob」；`run_command` 取命令主体
   （忽略 cwd/timeout）；其它回落参数 JSON 稳定序列化。参数非 dict 也不抛异常。
 
@@ -235,8 +238,7 @@ rm/mv，不加 delete_file/move_file。
 ## 双语同步与等价性
 
 - bo_en.py 由 bo.py 逐行生成（按行号做「中文行→英文行」映射），保持结构与行序不变。
-- 英文因语序需要补跨行拼接缺失的空格；成功文案前缀统一 `OK:`（对应中文 `已`，供 `tool_write_file`
-  判断是否追加提示）。
+- 英文因语序需要补跨行拼接缺失的空格；成功文案前缀统一 `OK:`（对应中文 `已`），只求双语对照一致，代码里不再据此做分支判断。
 - 符号表 diff（应只剩 `LEVEL_NAMES` 一行差异）：
 
 ```bash

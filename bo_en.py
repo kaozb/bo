@@ -10,7 +10,7 @@ Usage:
     export OPENAI_BASE_URL=https://api.deepseek.com/v1
     export OPENAI_API_KEY=sk-xxxx
     export MODEL=deepseek-chat
-    python BO.py
+    python bo_en.py
 
 Arguments:
     -m, --model NAME    model name (overrides MODEL / OPENAI_MODEL)
@@ -64,6 +64,7 @@ MAX_OUTPUT_CHARS = 30000             # max characters of a single tool result en
 MAX_LINE_CHARS = 2000                # max characters displayed for a single line by read_file
 MAX_READ_BYTES = 3 * 1024 * 1024     # file read/write size limit; anything larger is refused outright (to keep memory from blowing up)
 MAX_READ_MB = MAX_READ_BYTES // 1048576  # the limit in MB, reused by notice texts
+MAX_READ_LINES = 100000              # max lines read_file reads in a single call (limit ceiling)
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024  # max size of a single HTTP response
 MAX_SEARCH_FILE_BYTES = 2 * 1024 * 1024  # max bytes read per file by search
 MAX_SEARCH_RESULTS = 1000            # max number of result lines returned by one search
@@ -143,14 +144,15 @@ def _arr(desc, item_props, item_required):
 
 
 TOOLS = [
-    _fn("read_file", "read a file (with line numbers) or list a directory; offset starts at 1 and an offset for continued reading is given when the file is not fully read, "
+    _fn("read_file", "read a file (with line numbers) or list a directory; start_line starts at 1 and a start_line for continued reading is given when the file is not fully read, "
         "binary files are refused. Each output line carries a \"line number+Tab\" prefix; strip it when copying into edit_file's old_string.",
         {"path": _p("string", "file or directory path (relative or absolute)"),
-         "offset": _p("integer", "starting line number / starting item, starting at 1, default 1"),
-         "limit": _p("integer", "max lines to read for a file (default 2000) / max items to list for a directory (default 200)")},
+         "start_line": _p("integer", "starting line number / starting item, starting at 1, default 1"),
+         "limit": _p("integer", "required when reading a file: max lines to read this time (estimate it yourself) / max items to list for a directory (default 200)")},
         ["path"]),
     _fn("write_file", "create a new file or overwrite an existing one: give path + content. content is the complete final content of the file, "
-        "cannot be empty; a missing parent directory is created automatically. To change only part of a file do not use this tool, use edit_file instead.",
+        "cannot be empty; a missing parent directory is created automatically. To change only part of a file do not use this tool, use edit_file instead."
+        " To create an empty file use run_command's touch, not shell redirection.",
         {"path": _p("string", "file path"),
          "content": _p("string", "the complete final content of the file (cannot be empty)")},
         ["path", "content"]),
@@ -175,8 +177,8 @@ TOOLS = [
         {"pattern": _p("string", "regular expression; when it is not a valid regex, it is searched literally"),
          "path": _p("string", "file or directory to search, default current directory ."),
          "glob": _p("string", "search only files matching this wildcard (e.g. *.py), default all"),
-         "max_results": _p("integer", "max number of matching lines to return, default 100, limit 1000 (context lines are not counted; the output has a separate 30000 character limit)"),
-         "context_lines": _p("integer", "add N lines of context above and below each match (0-10), default 0")},
+         "max_results": _p("integer", "max number of matching lines to return, default 100, limit 1000 (context lines are not counted; the output has a separate 30000 character limit). invalid or out-of-range values fall back to the default"),
+         "context_lines": _p("integer", "add N lines of context above and below each match (0-10), default 0; invalid or out-of-range falls back to 0")},
         ["pattern"]),
     _fn("run_command", "run a command in the shell, returning the exit code and the merged stdout+stderr."
         "The command's stdin is empty; do not run interactive commands such as vim / top; when the output is too large only the beginning and end are kept and truncation is reported.",
@@ -227,7 +229,7 @@ def _truncate(text, limit=MAX_OUTPUT_CHARS, note=None):
     if len(text) <= limit:
         return text
     note = note or "\n... [truncated, the original text has %d characters]"
-    return text[:limit] + (note % len(text) if "%d" in note else note)
+    return text[:limit] + (note.replace("%d", str(len(text))) if "%d" in note else note)
 
 
 def _indent(text, prefix="    ", limit=MAX_OUTPUT_CHARS):
@@ -347,8 +349,8 @@ def _atomic_write(path, data, mode=None):
         raise
 
 
-def _read_lines_window(path, shown, offset, limit):
-    """Read a file by line window, returning (line list, total lines, error); offset is 0-based.
+def _read_lines_window(path, shown, start, limit):
+    """Read a file by line window, returning (line list, total lines, error); start is 0-based.
 
     The whole file is read and _decode_bytes detects the encoding (utf-8 → gbk → latin-1, so GBK and the like are read correctly too).
     Files above MAX_READ_BYTES are refused outright by _read_file_bytes and no longer go through streaming scanning,
@@ -360,11 +362,11 @@ def _read_lines_window(path, shown, offset, limit):
     if b"\x00" in raw[:8192]:
         return None, 0, _binary_error(shown)
     lines = _split_lines(_decode_bytes(raw)[0])
-    return lines[offset:offset + limit], len(lines), None
+    return lines[start:start + limit], len(lines), None
 
 
-def _list_dir(real, shown, offset=0, limit=200):
-    """List directory contents (used when read_file is given a directory); lists one level only, supports offset/limit paging."""
+def _list_dir(real, shown, start=0, limit=200):
+    """List directory contents (used when read_file is given a directory); lists one level only, supports start/limit paging."""
     try:
         with os.scandir(real) as it:
             entries = sorted(it, key=lambda e: e.name)
@@ -388,16 +390,16 @@ def _list_dir(real, shown, offset=0, limit=200):
     items = dirs + links + files + others
     if not items:
         return "Directory %s is empty." % shown
-    window = items[offset:offset + limit]
+    window = items[start:start + limit]
     if not window:
-        return "Directory %s has %d items in total, offset=%d is past the end." % (shown, len(items), offset + 1)
+        return "Directory %s has %d items in total, start_line=%d is past the end." % (shown, len(items), start + 1)
     note = ""
-    if offset + len(window) < len(items):
-        note = "\n... [%d more items, continue with offset=%d]" % (
-            len(items) - offset - len(window), offset + len(window) + 1)
+    if start + len(window) < len(items):
+        note = "\n... [%d more items, continue with start_line=%d]" % (
+            len(items) - start - len(window), start + len(window) + 1)
     return "Directory %s has %d items in total (directories %d / files %d), showing items %d-%d:\n%s%s" % (
         shown, len(items), len(dirs), len(files),
-        offset + 1, offset + len(window), "\n".join(window), note)
+        start + 1, start + len(window), "\n".join(window), note)
 
 
 def find_agent_file():
@@ -515,19 +517,34 @@ def tool_read_file(args, opts):
     if not shown:
         return "Error: missing path argument"
     path = os.path.realpath(shown)
-    offset = max(_int(args.get("offset"), 1, minimum=1) - 1, 0)  # 1-based externally, 0-based internally
+    start = max(_int(args.get("start_line"), 1, minimum=1) - 1, 0)  # 1-based externally, 0-based internally
     if os.path.isdir(path):
-        return _list_dir(path, shown, offset,
+        return _list_dir(path, shown, start,
                          min(_int(args.get("limit"), 200, minimum=1), MAX_DIR_ITEMS))
 
-    limit = _int(args.get("limit"), 2000, minimum=1)
-    lines, total, err = _read_lines_window(path, shown, offset, limit)
+    raw_limit = args.get("limit")
+    if raw_limit is None:
+        return ("Error: reading a file requires an explicit limit (max lines to read this time); "
+                "estimate it from the file size, do not omit it; pass a value large enough to read "
+                "the whole file, and use start_line to continue if needed.")
+    try:
+        limit = int(raw_limit)
+    except Exception:
+        return ("Error: limit must be a positive integer (max lines to read this time); "
+                "got %r; please call again with a positive integer." % (raw_limit,))
+    if limit < 1:
+        return ("Error: limit must be at least 1 (max lines to read this time); got %d; "
+                "please call again with a positive integer." % limit)
+    if limit > MAX_READ_LINES:
+        return ("Error: limit exceeds the per-call maximum (%d lines); got %d; "
+                "please lower it and retry, or use start_line to read in batches." % (MAX_READ_LINES, limit))
+    lines, total, err = _read_lines_window(path, shown, start, limit)
     if err:
         return err
     if total == 0:
         return "File %s is empty." % shown
-    if offset >= total:
-        return "File %s has %d lines in total, offset=%d is past the end of the file." % (shown, total, offset + 1)
+    if start >= total:
+        return "File %s has %d lines in total, start_line=%d is past the end of the file." % (shown, total, start + 1)
 
     # Assemble line by line and accumulate the character count: even with a large limit a single output stays within the context budget
     shown_lines, used, cut = [], 0, False
@@ -537,17 +554,19 @@ def tool_read_file(args, opts):
         if shown_lines and used + cost > MAX_OUTPUT_CHARS:
             cut = True
             break
-        shown_lines.append("%6d\t%s" % (offset + i + 1, text))
+        shown_lines.append("%6d\t%s" % (start + i + 1, text))
         used += cost
-    end = offset + len(shown_lines)
-    header = "File %s has %d lines in total, showing lines %d-%d:" % (shown, total, offset + 1, end)
+    end = start + len(shown_lines)
+    header = "File %s has %d lines in total, showing lines %d-%d, %d remaining:" % (
+        shown, total, start + 1, end, max(0, total - end))
     if end >= total:
-        footer = "\n[end of file reached]"
+        footer = "\n[end of file reached, 0 lines remaining]"
     elif cut:
-        footer = "\n[output reached the %d character limit, showing up to line %d this time; continue with offset=%d]" % (
-            MAX_OUTPUT_CHARS, end, end + 1)
+        footer = "\n[output reached the %d character limit, showing up to line %d this time, %d lines remaining; continue with start_line=%d]" % (
+            MAX_OUTPUT_CHARS, end, total - end, end + 1)
     else:
-        footer = "\n[%d lines not shown yet, continue with offset=%d]" % (total - end, end + 1)
+        footer = "\n[%d lines not shown yet (%d remaining), continue with start_line=%d]" % (
+            total - end, total - end, end + 1)
     return header + "\n" + "\n".join(shown_lines) + footer
 
 
@@ -581,7 +600,11 @@ def _write_whole_file(path, shown, args):
     """Mode one: write the whole file (create or overwrite)."""
     content = args.get("content")
     if not isinstance(content, str):
-        content = json.dumps(content, ensure_ascii=False, indent=2)
+        # non-string values (numbers/objects/arrays...) are written as JSON text, but must be valid JSON types
+        try:
+            content = json.dumps(content, ensure_ascii=False, indent=2)
+        except (TypeError, ValueError):
+            return "Error: content must be the file content as a string."
     if content == "":
         return ("Error: content is empty, which would clear the file, so the write was refused. To create an empty file use run_command's touch;"
                 " to really clear an existing file run `: > file` explicitly.")
@@ -592,8 +615,7 @@ def _write_whole_file(path, shown, args):
     enc, old_lines, old_bytes = "utf-8", 0, 0
     if existed:
         if os.path.getsize(path) > MAX_READ_BYTES:
-            return "Error: target file too large (> %d MB), refusing to overwrite the whole file; use edit_file for a partial change instead" % (
-                MAX_READ_BYTES // 1048576)
+            return "Error: target file too large (> %d MB), refusing to overwrite the whole file; use edit_file for a partial change instead" % MAX_READ_MB
         raw, err = _read_file_bytes(path)
         if err:
             return err
@@ -608,7 +630,7 @@ def _write_whole_file(path, shown, args):
         enc, data = "utf-8", content.encode("utf-8")
     if len(data) > MAX_READ_BYTES:
         return "Error: content to write too large (%.1f MB, limit %d MB)" % (
-            len(data) / 1048576.0, MAX_READ_BYTES // 1048576)
+            len(data) / 1048576.0, MAX_READ_MB)
 
     parent = os.path.dirname(path)
     if parent and not os.path.isdir(parent):
@@ -1609,7 +1631,9 @@ class Output(object):
 
     def tool_call(self, name, raw_args):
         if self.level >= LEVEL_NORMAL:
-            self._w(self._c("  · %s(%s)" % (name or "?", _brief(raw_args or "{}")), self.DIM) + "\n")
+            # run_command is not collapsed: once the command is truncated its arguments cannot be seen, and long commands especially need to be visible verbatim
+            brief = raw_args if name == "run_command" else _brief(raw_args or "{}")
+            self._w(self._c("  · %s(%s)" % (name or "?", brief or "{}"), self.DIM) + "\n")
 
     def tool_result(self, result, is_error):
         if self.level >= LEVEL_VERBOSE:
@@ -1642,10 +1666,10 @@ def build_system_prompt(opts):
         "\n"
         "available tools:\n%s\n"
         "\n"
-        "approach: locate with search first, then read_file to see the fragment clearly, then write_file (create/overwrite with content) "
+        "approach: locate with search first, then read_file to see the fragment clearly (you must pass limit yourself, do not rely on a default), then write_file (create/overwrite with content) "
         "or edit_file (a partial change with old_string + new_string), and finally verify with run_command (run tests/compile/execute scripts); "
         "do not guess out of thin air.\n"
-        "always create new files with write_file; do not assemble files with echo/cat redirection via run_command; "
+        "always create new files with write_file; do not assemble files with echo/cat redirection via run_command (for an empty file, touch is fine); "
         "delete or move files with rm / mv via run_command, and confirm dangerous operations with the user first.\n"
         "\n"
         "output: this is a plain-text terminal that does not render Markdown. Do not use syntax such as bold, headings or code fences. Answer concisely and directly.\n"
@@ -1713,7 +1737,7 @@ def _trim_history(messages, keep_rounds=TRIM_KEEP_ROUNDS):
 def _repeat_key(name, args):
     """Normalize one tool call into an "equivalence check" key, for the repeated-call guard.
 
-    Comparing the raw_args string directly is too fragile: moving read_file's offset by one or changing run_command's
+    Comparing the raw_args string directly is too fragile: moving read_file's start_line by one or changing run_command's
     timeout would be treated as a "new call", and the same file/same command would actually run over and over. Here only
     the "substantive arguments" are taken, by the semantics of each tool:
       - file tools (read_file / write_file / edit_file): tool name + the normalized path;
@@ -1867,13 +1891,13 @@ def run_turn(user_text, messages, opts, out):
         reasoning = msg.get("reasoning_content") or msg.get("reasoning") or ""
         tool_calls = msg.get("tool_calls") or []
 
-        # The content was already printed live during streaming, so only the log is written here (thinking is skipped at quiet level, the final answer is below)
+        # content was already streamed earlier (body text is not printed live at quiet level); here we only log it
         if reasoning:
             out.log("THINKING", reasoning.strip())
         if content:
             out.log("ASSISTANT", content)
         db_bump_tokens(out.conn, out.session_id, msg.get("_usage"), msg.get("_latency_ms"))
-        # content is empty but nothing was printed at quiet level, show it as a fallback
+        # at quiet level the body text was not printed during streaming, so show it once here as the final answer
         if content and out.level == LEVEL_QUIET and not tool_calls:
             out.assistant(content, True)
 
@@ -1929,35 +1953,25 @@ def run_turn(user_text, messages, opts, out):
             key = _repeat_key(name, args)
             repeat["n"] = repeat["n"] + 1 if key == repeat["key"] else 1
             repeat["key"] = key
+            try:
+                func = TOOL_FUNCS.get(name)
+                result = func(args, opts) if func else "Error: unknown tool %s" % name
+            except TurnInterrupted:
+                # interrupted halfway through tool execution: the result is untrustworthy, and later calls are not run either
+                result = ("Error: the user interrupted this turn with Ctrl+C, this call did not finish properly;"
+                          " do not keep calling tools, wait for the user's next instruction.")
+                aborted = True
+                abort_note = "Error: this turn was interrupted by Ctrl+C, this call did not execute."
+                abort_info = "this turn was interrupted (Ctrl+C); press Ctrl+C again to quit the program"
             if repeat["n"] >= REPEAT_WARN_CALLS:
                 # warning only, never abort: this call still runs, and the "stop repeating" note goes back to the model
                 # together with the result so the model can change its mind; endless repeats still never kill the session
                 # (it waits for the user or the model to converge).
-                try:
-                    func = TOOL_FUNCS.get(name)
-                    result = func(args, opts) if func else "Error: unknown tool %s" % name
-                except TurnInterrupted:
-                    result = ("Error: the user interrupted this turn with Ctrl+C, this call did not finish properly;"
-                              " do not keep calling tools, wait for the user's next instruction.")
-                    aborted = True
-                    abort_note = "Error: this turn was interrupted by Ctrl+C, this call did not execute."
-                    abort_info = "this turn was interrupted (Ctrl+C); press Ctrl+C again to quit the program"
                 # the guard note goes after the result: it must not hide the start of the real result (_is_error only reads the start)
                 result = result + ("\nWarning: the equivalent %s call has appeared %d times in a row; this call still ran, but do not repeat it."
                                    "\n[repeat-call guard] that file/command already ran this turn and the result is in the conversation above;"
                                    " do not call %s again with the same arguments. Continue with the result you already have, or try a different"
                                    " approach (different arguments do not count as a repeat)." % (name, repeat["n"], name))
-            else:
-                try:
-                    func = TOOL_FUNCS.get(name)
-                    result = func(args, opts) if func else "Error: unknown tool %s" % name
-                except TurnInterrupted:
-                    # interrupted halfway through tool execution: the result is untrustworthy, and later calls are not run either
-                    result = ("Error: the user interrupted this turn with Ctrl+C, this call did not finish properly;"
-                              " do not keep calling tools, wait for the user's next instruction.")
-                    aborted = True
-                    abort_note = "Error: this turn was interrupted by Ctrl+C, this call did not execute."
-                    abort_info = "this turn was interrupted (Ctrl+C); press Ctrl+C again to quit the program"
 
             out.log("TOOL_RESULT " + (name or "?"), result, tool_call_id=tc.get("id"))
             out.tool_result(result, _is_error(result))

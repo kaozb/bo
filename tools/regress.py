@@ -50,42 +50,47 @@ def w(path, data, enc=None):
 def test_read_file(d):
     sys.stdout.write("read_file\n")
     empty = w(os.path.join(d, "empty.txt"), b"")
-    check("空文件", "是空文件" in bo.tool_read_file({"path": empty}, OPTS))
+    check("空文件", "是空文件" in bo.tool_read_file({"path": empty, "limit": 2000}, OPTS))
 
     nonl = w(os.path.join(d, "nonl.txt"), b"a\nb\nc")
-    out = bo.tool_read_file({"path": nonl}, OPTS)
+    check("缺 limit 报错", "必须显式给 limit" in bo.tool_read_file({"path": nonl}, OPTS))
+    check("limit 非整数报错", "必须是正整数" in bo.tool_read_file({"path": nonl, "limit": "abc"}, OPTS))
+    check("limit 超限报错", "超出单次上限" in bo.tool_read_file({"path": nonl, "limit": 99999999}, OPTS))
+    out = bo.tool_read_file({"path": nonl, "limit": 2000}, OPTS)
     check("无尾换行计 3 行", "共 3 行" in out, out[:60])
 
     crlf = w(os.path.join(d, "crlf.txt"), b"a\r\nb\r\nc\r\n")
-    out = bo.tool_read_file({"path": crlf}, OPTS)
+    out = bo.tool_read_file({"path": crlf, "limit": 2000}, OPTS)
     check("CRLF 行数", "共 3 行" in out, out[:60])
     check("CRLF 行尾无 \\r", "\r" not in out, repr(out[:80]))
 
     vt = w(os.path.join(d, "vt.txt"), b"a\x0bb\x0cc\n")
-    check("\\x0b/\\x0c 不当行分隔", "共 1 行" in bo.tool_read_file({"path": vt}, OPTS))
+    check("\\x0b/\\x0c 不当行分隔", "共 1 行" in bo.tool_read_file({"path": vt, "limit": 2000}, OPTS))
 
     gbk = w(os.path.join(d, "gbk.txt"), "中文内容\n第二行\n".encode("gbk"))
-    out = bo.tool_read_file({"path": gbk}, OPTS)
+    out = bo.tool_read_file({"path": gbk, "limit": 2000}, OPTS)
     check("GBK 中文解码", "中文内容" in out and "第二行" in out, repr(out[:60]))
 
     binf = w(os.path.join(d, "bin.dat"), b"\x00\x01\x02abc\n")
-    check("二进制拒绝读取", "疑似二进制文件" in bo.tool_read_file({"path": binf}, OPTS))
+    check("二进制拒绝读取", "疑似二进制文件" in bo.tool_read_file({"path": binf, "limit": 2000}, OPTS))
 
-    check("offset 越界提示", "已超出文件末尾" in bo.tool_read_file({"path": nonl, "offset": 99}, OPTS))
-    check("文件不存在", "文件不存在" in bo.tool_read_file({"path": os.path.join(d, "nope.txt")}, OPTS))
+    check("start_line 越界提示", "已超出文件末尾" in bo.tool_read_file({"path": nonl, "start_line": 99, "limit": 2000}, OPTS))
+    check("limit 为 0 报错", "必须不小于 1" in bo.tool_read_file({"path": nonl, "limit": 0}, OPTS))
+    check("limit 为负报错", "必须不小于 1" in bo.tool_read_file({"path": nonl, "limit": -5}, OPTS))
+    check("文件不存在", "文件不存在" in bo.tool_read_file({"path": os.path.join(d, "nope.txt"), "limit": 2000}, OPTS))
 
     sub = os.path.join(d, "dir", "sub")
     os.makedirs(sub)
     w(os.path.join(d, "dir", "f1.txt"), b"x")
     os.symlink("f1.txt", os.path.join(d, "dir", "link1"))
-    out = bo.tool_read_file({"path": os.path.join(d, "dir")}, OPTS)
+    out = bo.tool_read_file({"path": os.path.join(d, "dir"), "limit": 2000}, OPTS)
     check("目录列举", "共 3 项" in out and "f1.txt" in out and "link1 ->" in out, out[:100])
 
     big = os.path.join(d, "big.txt")
     with open(big, "w") as f:
         for i in range(400000):
             f.write("line %07d abcdefghijklmnop\n" % i)
-    out = bo.tool_read_file({"path": big, "offset": 399998, "limit": 5}, OPTS)
+    out = bo.tool_read_file({"path": big, "start_line": 399998, "limit": 5}, OPTS)
     check("大文件(>3MB)拒绝读取", "文件过大" in out and "上限 3 MB" in out, out[:100])
 
 
