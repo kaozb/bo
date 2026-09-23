@@ -31,7 +31,7 @@ Argument memory: connection-type arguments passed explicitly (-m / -b / -k / -s 
 
 Definition of a round: one active input from the user counts as one round, and a round may contain many tool calls; --tool controls how many recent rounds are kept.
 
-Interaction: /reset clears and starts a new session, /s loads a past session, /help shows help, exit quits
+Interaction: /r clears and starts a new session, /s loads a past session, /c clears all session history in the database, /h shows help, exit quits
 """
 
 import argparse
@@ -1430,6 +1430,15 @@ def db_list_sessions(conn, limit=10):
         "SELECT id, title FROM sessions ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
 
 
+def db_clear_sessions(conn):
+    """Clear all session history in the database, returning the number of sessions deleted. The schema is not rebuilt, only the data is cleared."""
+    n = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+    conn.execute("DELETE FROM events")
+    conn.execute("DELETE FROM sessions")
+    conn.commit()
+    return n
+
+
 def db_load_session(conn, sid, system_prompt=None):
     """Restore a session into a messages list by seq (including the system prompt).
 
@@ -2184,7 +2193,7 @@ def main():
         sys.stdout.write("argument memory: written to %s\n" % CONFIG_FILE)
     elif opts["config_error"]:
         sys.stderr.write("warning: writing %s failed: %s\n" % (CONFIG_FILE, opts["config_error"]))
-    sys.stdout.write("type /help for help, exit to quit.\n")
+    sys.stdout.write("type /h for help, exit to quit.\n")
 
     messages = [{"role": "system", "content": system_prompt}]
     started = time.time()
@@ -2201,7 +2210,7 @@ def main():
             if user in ("exit", "quit", "/exit", "/quit"):
                 sys.stdout.write("bye.\n")
                 break
-            if user == "/reset":
+            if user in ("/r", "/reset"):
                 _new_session(opts, out)
                 messages = [{"role": "system", "content": system_prompt}]
                 sys.stdout.write("cleared the conversation history, a new session starts with your next input.\n")
@@ -2230,11 +2239,21 @@ def main():
                     else:
                         sys.stdout.write("that session has nothing to load.\n")
                 continue
-            if user == "/help":
+            if user == "/c":
+                if not opts["confirm"] and not _confirm("clear all session history in the database? This cannot be undone (y/N) "):
+                    sys.stdout.write("cancelled.\n")
+                    continue
+                _new_session(opts, out)         # finish and disconnect the current session first, so nothing keeps writing to it after the database is cleared
+                messages = [{"role": "system", "content": system_prompt}]
+                n = db_clear_sessions(out.conn)
+                sys.stdout.write("cleared the session database, %d sessions deleted.\n" % n)
+                continue
+            if user in ("/h", "/help"):
                 sys.stdout.write("available interaction commands:\n"
-                                 "  /reset   clear the conversation history, start a new session\n"
+                                 "  /r       clear the conversation history, start a new session (same as /reset)\n"
                                  "  /s       load and continue a past session\n"
-                                 "  /help    show this help\n"
+                                 "  /c       clear all session history in the database\n"
+                                 "  /h       show this help (same as /help)\n"
                                  "  exit     quit\n"
                                  "  Ctrl+C   the first press only interrupts the current turn (generation/command), press again to quit\n")
                 continue

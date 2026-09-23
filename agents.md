@@ -99,7 +99,8 @@ BO 是单文件、纯标准库的最小编码智能体，走 OpenAI 兼容接口
 rm/mv，不加 delete_file/move_file。
 
 完整交互写入 **SQLite 会话库**（默认 `.ai.db`，`-d/--db` 或环境变量 `BO_DB` 指定；sqlite3 是标准库，
-不破坏零依赖）。交互命令：`/reset` 清空并延迟开新会话、`/s` 载入历史会话、`/help`、`exit`。
+不破坏零依赖）。交互命令：`/r`（同 `/reset`，旧名保留）清空并延迟开新会话、`/s` 载入历史会话、
+`/c` 清空库中全部会话历史（需确认，`-y` 跳过）、`/h`（同 `/help`）、`exit`。
 
 启动参数：`-m/-b/-k/-s/-t/-T/-d` 为连接类参数（写入 `.bo`），`-y/-q/-v/-C` 仅本次生效；
 `-l/--list-models` 拉取 `/models` 让用户按编号选模型，写入 `.bo` 后直接退出。
@@ -152,7 +153,9 @@ rm/mv，不加 delete_file/move_file。
   否则被静默丢弃）；`db_bump_tokens` 累计 usage 并把耗时写回最近一条 assistant 事件。
   **思考（reasoning）从不入库**，因此也不会被还原。
 - title = 首条 user 消息首行（≤60 字符），仅在 title 为空时写。
-- `/reset` → `_new_session`（延迟建库）；`/s` → `choose_session` 列最近 10 条（**只显示标题**）→
+- `/r`（`/reset`）→ `_new_session`（延迟建库）；`/c` → `_confirm` 确认后 `_new_session` 断开会话
+  再 `db_clear_sessions`（`DELETE FROM events/sessions`，只清数据不重建表）并重置 messages；
+  `/s` → `choose_session` 列最近 10 条（**只显示标题**）→
   `db_load_session` 还原 → `load_history` 走同一 `_trim_history` 并用 `_close_tool_calls` 补齐悬空结果。
 
 ## 工具层关键设计（改动时不要回退）

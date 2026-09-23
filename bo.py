@@ -31,7 +31,7 @@
 
 一轮的定义: 一次用户主动输入算一轮，轮内可能有很多次工具调用；--tool 控制保留最近几轮。
 
-交互: /reset 清空并开新会话，/s 载入历史会话，/help 帮助，exit 退出
+交互: /r 清空并开新会话，/s 载入历史会话，/c 清空库中全部会话历史，/h 帮助，exit 退出
 """
 
 import argparse
@@ -1429,6 +1429,15 @@ def db_list_sessions(conn, limit=10):
         "SELECT id, title FROM sessions ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
 
 
+def db_clear_sessions(conn):
+    """清空库中全部会话历史，返回删除的会话条数。表结构不重建，只清数据。"""
+    n = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+    conn.execute("DELETE FROM events")
+    conn.execute("DELETE FROM sessions")
+    conn.commit()
+    return n
+
+
 def db_load_session(conn, sid, system_prompt=None):
     """按 seq 把某会话还原成 messages 列表（含 system 提示词）。
 
@@ -2179,7 +2188,7 @@ def main():
         sys.stdout.write("参数记忆: 已写入 %s\n" % CONFIG_FILE)
     elif opts["config_error"]:
         sys.stderr.write("警告: 写入 %s 失败: %s\n" % (CONFIG_FILE, opts["config_error"]))
-    sys.stdout.write("输入 /help 查看帮助，exit 退出。\n")
+    sys.stdout.write("输入 /h 查看帮助，exit 退出。\n")
 
     messages = [{"role": "system", "content": system_prompt}]
     started = time.time()
@@ -2196,7 +2205,7 @@ def main():
             if user in ("exit", "quit", "/exit", "/quit"):
                 sys.stdout.write("再见。\n")
                 break
-            if user == "/reset":
+            if user in ("/r", "/reset"):
                 _new_session(opts, out)
                 messages = [{"role": "system", "content": system_prompt}]
                 sys.stdout.write("已清空对话历史，下次输入将开启新会话。\n")
@@ -2225,11 +2234,21 @@ def main():
                     else:
                         sys.stdout.write("该会话没有可载入的内容。\n")
                 continue
-            if user == "/help":
+            if user == "/c":
+                if not opts["confirm"] and not _confirm("确定清空库中全部会话历史？不可恢复 (y/N) "):
+                    sys.stdout.write("已取消。\n")
+                    continue
+                _new_session(opts, out)         # 当前会话先收尾并断开，避免清库后继续往上写
+                messages = [{"role": "system", "content": system_prompt}]
+                n = db_clear_sessions(out.conn)
+                sys.stdout.write("已清空会话库，共删除 %d 个会话。\n" % n)
+                continue
+            if user in ("/h", "/help"):
                 sys.stdout.write("可用交互命令:\n"
-                                 "  /reset   清空对话历史，开启新会话\n"
+                                 "  /r       清空对话历史，开启新会话（同 /reset）\n"
                                  "  /s       载入并继续某个历史会话\n"
-                                 "  /help    显示本帮助\n"
+                                 "  /c       清空库中全部会话历史\n"
+                                 "  /h       显示本帮助（同 /help）\n"
                                  "  exit     退出\n"
                                  "  Ctrl+C   第一次只中断当前一轮（生成/命令），再按一次退出\n")
                 continue
